@@ -1,0 +1,108 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>HTTPAutomation</AssemblyName>
+    <RootNamespace>HTTPAutomation</RootNamespace>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GameManaged>B:\Steam\steamapps\common\Timberborn\Timberborn_Data\Managed</GameManaged>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Source lives in ../src/ relative to this csproj in build/ -->
+    <Compile Include="../src/**/*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Bindito.Core">
+      <HintPath>$(GameManaged)\Bindito.Core.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Bindito.Unity">
+      <HintPath>$(GameManaged)\Bindito.Unity.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GameManaged)\UnityEngine.CoreModule.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.ModManagerScene">
+      <HintPath>$(GameManaged)\Timberborn.ModManagerScene.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.HttpApiSystem">
+      <HintPath>$(GameManaged)\Timberborn.HttpApiSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.TimeSystem">
+      <HintPath>$(GameManaged)\Timberborn.TimeSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.GameCycleSystem">
+      <HintPath>$(GameManaged)\Timberborn.GameCycleSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.WeatherSystem">
+      <HintPath>$(GameManaged)\Timberborn.WeatherSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.HazardousWeatherSystem">
+      <HintPath>$(GameManaged)\Timberborn.HazardousWeatherSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.Beavers">
+      <HintPath>$(GameManaged)\Timberborn.Beavers.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.Characters">
+      <HintPath>$(GameManaged)\Timberborn.Characters.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.EntityNaming">
+      <HintPath>$(GameManaged)\Timberborn.EntityNaming.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.NeedSystem">
+      <HintPath>$(GameManaged)\Timberborn.NeedSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.TickSystem">
+      <HintPath>$(GameManaged)\Timberborn.TickSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.WorkSystem">
+      <HintPath>$(GameManaged)\Timberborn.WorkSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.DwellingSystem">
+      <HintPath>$(GameManaged)\Timberborn.DwellingSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.BaseComponentSystem">
+      <HintPath>$(GameManaged)\Timberborn.BaseComponentSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.Common">
+      <HintPath>$(GameManaged)\Timberborn.Common.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.Modding">
+      <HintPath>$(GameManaged)\Timberborn.Modding.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.SingletonSystem">
+      <HintPath>$(GameManaged)\Timberborn.SingletonSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.Population">
+      <HintPath>$(GameManaged)\Timberborn.Population.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.GameSaveRuntimeSystem">
+      <HintPath>$(GameManaged)\Timberborn.GameSaveRuntimeSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.GameSaveRepositorySystem">
+      <HintPath>$(GameManaged)\Timberborn.GameSaveRepositorySystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.SettlementNameSystem">
+      <HintPath>$(GameManaged)\Timberborn.SettlementNameSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.NeedSpecs">
+      <HintPath>$(GameManaged)\Timberborn.NeedSpecs.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.Wellbeing">
+      <HintPath>$(GameManaged)\Timberborn.Wellbeing.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="System.Collections.Immutable">
+      <HintPath>$(GameManaged)\System.Collections.Immutable.dll</HintPath><Private>false</Private>
+    </Reference>
+    <Reference Include="Timberborn.BlueprintSystem">
+      <HintPath>$(GameManaged)\Timberborn.BlueprintSystem.dll</HintPath><Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

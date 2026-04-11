@@ -1,0 +1,8 @@
+{
+  "Name": "HTTPAutomisation",
+  "Version": "5.3.0",
+  "Id": "HTTPAutomisation",
+  "MinimumGameVersion": "1.0.0.0",
+  "Description": "Replaces the Timberborn HTTP API web UI with a full automation dashboard. Shows game state, population with need bars, and lets you create IF-adapter-THEN-set-lever automation rules. Includes a native DLL that adds /api/gamestate and /api/population endpoints.",
+  "RequiredMods": []
+}

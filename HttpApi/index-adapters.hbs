@@ -1,0 +1,5 @@
+<script>
+window.TB=window.TB||{};
+window.TB.adaptersUrl="{{adaptersUrl}}";
+window.TB.adapters=[{{#each adapters}}{"name":"{{{name}}}","state":{{#if state}}true{{else}}false{{/if}},"url":"{{{url}}}"}{{#unless @last}},{{/unless}}{{/each}}];
+</script>

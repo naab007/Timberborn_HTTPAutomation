@@ -1,0 +1,1491 @@
+<script>
+// ── Global error handler — surfaces JS errors that would otherwise fail silently ──
+window.onerror = function(msg, src, line, col, err) {
+    var text = 'JS ERROR: ' + msg + ' (line ' + line + ')';
+    var el = document.getElementById('tac-err');
+    if (el) {
+        el.textContent = text;
+        el.className = 'alert alert-danger position-fixed bottom-0 start-50 translate-middle-x mb-3 shadow';
+        el.style.cssText = 'z-index:9999;text-align:center;min-width:260px;display:block';
+    } else {
+        alert(text);
+    }
+    return false; // let the browser also log it
+};
+(function () {
+'use strict';
+
+// ── Fallback detection ────────────────────────────────────────────────────────
+var DLL_AVAILABLE = null;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+var S = {
+    levers:         (window.TB && window.TB.levers)   || [],
+    adapters:       (window.TB && window.TB.adapters) || [],
+    sensors:        [],
+    gameState:      null,
+    population:     null,
+    beavers:        [],
+    beaversLoaded:  false,
+    rules:          loadRules(),
+    tab:            'dashboard',
+    polling:        false,
+    automationView: 'list',
+    editingRuleId:  null,
+    codeLogs:       {},   // { [ruleId]: [{time, msg, isErr}] }
+    fbdSignals:     {},   // { 'nodeId_pinName': boolean }
+    showImport:      false,  // whether import JSON panel is open
+    currentSaveName: '',     // save name last loaded from server; '' = no save loaded yet
+    uiLog:           [],     // [{time, level, msg}]  frontend activity log
+    logFilter:       'all'   // 'all' | 'ok' | 'warn' | 'err' | 'rule'
+};
+
+// ── Frontend activity log ─────────────────────────────────────────────────────
+var UI_LOG_MAX = 300;
+var UI_LOG_LEVELS = { ok:'ok', info:'info', warn:'warn', err:'err', rule:'rule', sync:'sync' };
+
+function uiLog(level, msg) {
+    var now = new Date();
+    var ts  = now.getHours().toString().padStart(2,'0') + ':'
+            + now.getMinutes().toString().padStart(2,'0') + ':'
+            + now.getSeconds().toString().padStart(2,'0');
+    S.uiLog.unshift({ time: ts, level: level, msg: msg });
+    if (S.uiLog.length > UI_LOG_MAX) S.uiLog.length = UI_LOG_MAX;
+    // Patch log panel if it's visible without a full render
+    if (S.tab === 'logs') {
+        var panel = document.getElementById('tac-log-panel');
+        if (panel) panel.innerHTML = renderLogLines();
+    }
+}
+
+// ── FBD canvas runtime state (not persisted) ──────────────────────────────────
+var FBD = {
+    canvas: null, ctx: null, ruleId: null,
+    pan: { x: 20, y: 20 },
+    zoom: 1.0,
+    drag: null, wire: null, selected: null,
+    mouse: { x: 0, y: 0 },
+    spaceDown: false, panning: false, panStart: null,
+    paramInputs: [],   // [{nodeId,key,type,opts,min,max,step,val,x,y,w,h}] world-space hit rects
+    inlineInput: null  // currently active overlay <input>/<select> element
+};
+
+// ── FBD node type definitions ─────────────────────────────────────────────────
+// needsDll flag: node evaluates to false when DLL unavailable (graceful degradation)
+var FBD_DEFS = {
+    INPUT_ADAPTER:    { label:'Adapter',     cat:'Input',  color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:false },
+    INPUT_LEVER:      { label:'Lever State', cat:'Input',  color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:false },
+    INPUT_SENSOR:     { label:'Sensor',      cat:'Input',  color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:true  },
+    INPUT_GAMESTATE:  { label:'Game State', cat:'Input',  color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:true  },
+    INPUT_TIME:       { label:'Time Range', cat:'Input',  color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:true  },
+    INPUT_POPULATION: { label:'Population', cat:'Input',  color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:true  },
+    LOGIC_AND:        { label:'AND',        cat:'Logic',  color:'#1a3d1a', inputs:['A','B'], outputs:['Q'], needsDll:false },
+    LOGIC_OR:         { label:'OR',         cat:'Logic',  color:'#1a3d1a', inputs:['A','B'], outputs:['Q'], needsDll:false },
+    LOGIC_NAND:       { label:'NAND',       cat:'Logic',  color:'#1a3d1a', inputs:['A','B'], outputs:['Q'], needsDll:false },
+    LOGIC_NOR:        { label:'NOR',        cat:'Logic',  color:'#1a3d1a', inputs:['A','B'], outputs:['Q'], needsDll:false },
+    LOGIC_NOT:        { label:'NOT',        cat:'Logic',  color:'#1a3d1a', inputs:['IN'],    outputs:['Q'], needsDll:false },
+    LOGIC_TIMER:      { label:'TON (On Delay)',  cat:'Logic',  color:'#3d2a00', inputs:['IN'],    outputs:['Q'], needsDll:false },
+    LOGIC_TOF:        { label:'TOF (Off Delay)', cat:'Logic',  color:'#3d2a00', inputs:['IN'],    outputs:['Q'], needsDll:false },
+    LOGIC_TP:         { label:'TP (Pulse)',      cat:'Logic',  color:'#3d2a00', inputs:['IN'],    outputs:['Q'], needsDll:false },
+    LOGIC_GEN:        { label:'Generator',       cat:'Logic',  color:'#3d2a00', inputs:['IN'],    outputs:['Q'], needsDll:false },
+    LOGIC_CTU:        { label:'Counter (CTU)',   cat:'Logic',  color:'#3d2a00', inputs:['CU','R'],outputs:['Q'], needsDll:false },
+    LOGIC_RTC:        { label:'Real-Time Clock', cat:'Logic',  color:'#3d2a00', inputs:[],        outputs:['Q'], needsDll:false },
+    LOGIC_SRLATCH:    { label:'SR-Latch',   cat:'Logic',  color:'#3d2a00', inputs:['S','R'], outputs:['Q'], needsDll:false },
+    LOGIC_COMPARE:    { label:'Compare',    cat:'Logic',  color:'#1a3d1a', inputs:[],        outputs:['Q'], needsDll:true  },
+    ALWAYS_HIGH:      { label:'Always HIGH', cat:'Input', color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:false },
+    ALWAYS_LOW:       { label:'Always LOW',  cat:'Input', color:'#0d3a5c', inputs:[],        outputs:['Q'], needsDll:false },
+    OUTPUT_LEVER:     { label:'Set Lever',  cat:'Output', color:'#4a1010', inputs:['IN'],    outputs:[],    needsDll:false }
+};
+var FBD_W = 150, FBD_ROW = 22, FBD_HEAD = 26, FBD_PAD = 8;
+var FBD_PR = 6;        // visual pin radius (drawn circle)
+var FBD_PR_HIT = 12;   // invisible hit radius (easier to connect)
+var FBD_UNDO = [];     // [{nodes:[], edges:[]}] undo stack for current rule
+var FBD_UNDO_MAX = 20;
+function fbdPushUndo(rule){if(!rule||!rule.fbd)return;FBD_UNDO.push(JSON.stringify({nodes:rule.fbd.nodes,edges:rule.fbd.edges}));if(FBD_UNDO.length>FBD_UNDO_MAX)FBD_UNDO.shift();}
+function fbdUndo(rule){if(!rule||!rule.fbd||!FBD_UNDO.length)return;var snap=JSON.parse(FBD_UNDO.pop());rule.fbd.nodes=snap.nodes;rule.fbd.edges=snap.edges;FBD.selected=null;if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}saveRules();fbdDrawCanvas();}
+
+function fbdNodeH(type) { var d=FBD_DEFS[type]; if(!d)return 60; return FBD_HEAD+Math.max(d.inputs.length,d.outputs.length,1)*FBD_ROW+FBD_PAD; }
+function fbdPinPos(node, isInput, idx) { return { x: isInput ? node.x : node.x+FBD_W, y: node.y+FBD_HEAD+idx*FBD_ROW+FBD_ROW/2 }; }
+function fbdMakeNodeId() { return 'n_'+Date.now()+'_'+Math.floor(Math.random()*1000); }
+function fbdMakeEdgeId() { return 'e_'+Date.now()+'_'+Math.floor(Math.random()*1000); }
+function fbdScreenToWorld(sx, sy) { if(!FBD.canvas)return{x:0,y:0}; var r=FBD.canvas.getBoundingClientRect(); return{x:(sx-r.left-FBD.pan.x)/FBD.zoom, y:(sy-r.top-FBD.pan.y)/FBD.zoom}; }
+function fbdNodeAt(wx, wy, nodes) { for(var i=nodes.length-1;i>=0;i--){var n=nodes[i];if(wx>=n.x&&wx<=n.x+FBD_W&&wy>=n.y&&wy<=n.y+fbdNodeH(n.type))return n;} return null; }
+function fbdPinAt(wx, wy, nodes) {
+    for(var i=0;i<nodes.length;i++){var n=nodes[i],d=FBD_DEFS[n.type];if(!d)continue;
+        for(var j=0;j<d.inputs.length;j++){var p=fbdPinPos(n,true,j);if(Math.hypot(wx-p.x,wy-p.y)<FBD_PR_HIT)return{node:n,isInput:true,pin:d.inputs[j]};}
+        for(var k=0;k<d.outputs.length;k++){var q=fbdPinPos(n,false,k);if(Math.hypot(wx-q.x,wy-q.y)<FBD_PR_HIT)return{node:n,isInput:false,pin:d.outputs[k]};}}
+    return null;
+}
+function fbdBezierDist(px, py, x0, y0, x1, y1) {
+    var cx=Math.abs(x1-x0)*0.5+40, minD=Infinity;
+    for(var t=0;t<=1;t+=0.05){var u=1-t;var bx=u*u*u*x0+3*u*u*t*(x0+cx)+3*u*t*t*(x1-cx)+t*t*t*x1;var by=u*u*u*y0+3*u*u*t*y0+3*u*t*t*y1+t*t*t*y1;minD=Math.min(minD,Math.hypot(px-bx,py-by));}
+    return minD;
+}
+function fbdHitEdge(wx, wy, nodes, edges) {
+    for(var i=0;i<edges.length;i++){var e=edges[i];var fn=nodes.find(function(n){return n.id===e.fromNodeId;});var tn=nodes.find(function(n){return n.id===e.toNodeId;});if(!fn||!tn)continue;var fd=FBD_DEFS[fn.type],td=FBD_DEFS[tn.type];if(!fd||!td)continue;var fi=fd.outputs.indexOf(e.fromPin),ti=td.inputs.indexOf(e.toPin);if(fi<0||ti<0)continue;var p0=fbdPinPos(fn,false,fi),p1=fbdPinPos(tn,true,ti);if(fbdBezierDist(wx,wy,p0.x,p0.y,p1.x,p1.y)<8)return e;}
+    return null;
+}
+function fbdDefaultParams(type) {
+    switch(type){
+        case'INPUT_ADAPTER':  return{adapterName:(S.adapters[0]&&S.adapters[0].name)||'',adapterState:'on'};
+        case'INPUT_SENSOR':   return{sensorName:(S.sensors[0]&&S.sensors[0].name)||'',sensorState:'on'};
+        case'INPUT_GAMESTATE':return{field:'isDay'};
+        case'INPUT_TIME':     return{fromHour:6,toHour:20};
+        case'INPUT_POPULATION':return{field:'homeless',op:'gt',threshold:0};
+        case'ALWAYS_HIGH':    return{};
+        case'ALWAYS_LOW':     return{};
+        case'LOGIC_TIMER':    return{preset:10};
+        case'LOGIC_TOF':      return{preset:10};
+        case'LOGIC_TP':       return{preset:5};
+        case'LOGIC_GEN':      return{onTime:5,offTime:5};
+        case'LOGIC_CTU':      return{preset:5};
+        case'LOGIC_RTC':      return{fromHour:8,toHour:18};
+        case'LOGIC_COMPARE':  return{field:'homeless',op:'gt',threshold:0};
+        case'OUTPUT_LEVER':   return{leverName:(S.levers[0]&&S.levers[0].name)||'',leverState:'on',springReturn:true};
+        default:return{};
+    }
+}
+function fbdNodeParamSummary(node) {
+    var p=node.params||{};
+    switch(node.type){
+        case'INPUT_ADAPTER':  return(p.adapterName||'?')+' '+(p.adapterState||'on').toUpperCase();
+        case'INPUT_SENSOR':   return(p.sensorName||'?')+' is '+(p.sensorState||'on').toUpperCase();
+        case'INPUT_GAMESTATE':return p.field||'?';
+        case'INPUT_TIME':     return(p.fromHour||0)+'\u2013'+(p.toHour||12)+'h';
+        case'INPUT_POPULATION':return(p.field||'?')+' '+(p.op||'>')+' '+(p.threshold||0);
+        case'ALWAYS_HIGH':    return 'TRUE';
+        case'ALWAYS_LOW':     return 'FALSE';
+        case'LOGIC_TIMER':    return'TON PT='+(p.preset||10)+'s';
+        case'LOGIC_TOF':      return'TOF PT='+(p.preset||10)+'s';
+        case'LOGIC_TP':       return'TP PT='+(p.preset||5)+'s';
+        case'LOGIC_GEN':      return'ON='+(p.onTime||5)+'s OFF='+(p.offTime||5)+'s';
+        case'LOGIC_CTU':      return'PV='+(p.preset||5);
+        case'LOGIC_RTC':      return(p.fromHour||8)+'\u2013'+(p.toHour||18)+'h';
+        case'LOGIC_COMPARE':  return(p.field||'?')+' '+(p.op||'>')+' '+(p.threshold||0);
+        case'OUTPUT_LEVER':   return(p.leverName||'?')+' \u2192 '+(p.leverState||'on').toUpperCase()+(p.springReturn?' \u21ba':'');
+        default:return'';
+    }
+}
+function fbdParamDefs(node){
+    var p=node.params||{};
+    var adapOpts=S.adapters.length?S.adapters.map(function(a){return[a.name,a.name];}):[['',' — ']];
+    var leverOpts=S.levers.length?S.levers.map(function(l){return[l.name,l.name];}):[['',' — ']];
+    var sensorOpts=S.sensors.length?S.sensors.map(function(s){return[s.name,s.name];}):[['',' — ']];
+    var onOff=[['on','ON'],['off','OFF']];
+    var popF=[['totalBeavers','Total'],['adults','Adults'],['children','Children'],['unemployed','Idle'],['homeless','Homeless'],['injured','Injured'],['contaminated','Contam.']];
+    var opO=[['gt','>'],['gte','\u2265'],['lt','<'],['lte','\u2264'],['eq','=']];
+    var gsF=[['isDay','Daytime'],['isNight','Nighttime'],['isDrought','Drought'],['isBadtide','Badtide'],['isHazardous','Hazardous'],['weatherIsHazardous','Any Hazardous']];
+    switch(node.type){
+        case'INPUT_ADAPTER':return[{key:'adapterName',label:'Adapter',type:'select',opts:adapOpts,val:p.adapterName},{key:'adapterState',label:'State',type:'select',opts:onOff,val:p.adapterState||'on'}];
+        case'INPUT_LEVER':return[{key:'leverName',label:'Lever',type:'select',opts:leverOpts,val:p.leverName},{key:'leverState',label:'Is',type:'select',opts:onOff,val:p.leverState||'on'}];
+        case'INPUT_SENSOR':return[{key:'sensorName',label:'Sensor',type:'select',opts:sensorOpts,val:p.sensorName},{key:'sensorState',label:'Signal',type:'select',opts:onOff,val:p.sensorState||'on'}];
+        case'INPUT_GAMESTATE':return[{key:'field',label:'Field',type:'select',opts:gsF,val:p.field||'isDay'}];
+        case'INPUT_TIME':return[{key:'fromHour',label:'From (h)',type:'number',min:0,max:23,step:0.5,val:p.fromHour!==undefined?p.fromHour:6},{key:'toHour',label:'To (h)',type:'number',min:0,max:23,step:0.5,val:p.toHour!==undefined?p.toHour:20}];
+        case'INPUT_POPULATION':case'LOGIC_COMPARE':return[{key:'field',label:'Field',type:'select',opts:popF,val:p.field||'homeless'},{key:'op',label:'Op',type:'select',opts:opO,val:p.op||'gt'},{key:'threshold',label:'Value',type:'number',min:0,max:9999,step:1,val:p.threshold!==undefined?p.threshold:0}];
+        case'LOGIC_TIMER':return[{key:'preset',label:'On Delay (s)',type:'number',min:1,max:3600,step:1,val:p.preset!==undefined?p.preset:10}];
+        case'LOGIC_TOF':return[{key:'preset',label:'Off Delay (s)',type:'number',min:1,max:3600,step:1,val:p.preset!==undefined?p.preset:10}];
+        case'LOGIC_TP':return[{key:'preset',label:'Pulse (s)',type:'number',min:1,max:3600,step:1,val:p.preset!==undefined?p.preset:5}];
+        case'LOGIC_GEN':return[{key:'onTime',label:'ON time (s)',type:'number',min:0.5,max:3600,step:0.5,val:p.onTime!==undefined?p.onTime:5},{key:'offTime',label:'OFF time (s)',type:'number',min:0.5,max:3600,step:0.5,val:p.offTime!==undefined?p.offTime:5}];
+        case'LOGIC_CTU':return[{key:'preset',label:'Preset count',type:'number',min:1,max:9999,step:1,val:p.preset!==undefined?p.preset:5}];
+        case'LOGIC_RTC':return[{key:'fromHour',label:'From (h)',type:'number',min:0,max:23,step:0.5,val:p.fromHour!==undefined?p.fromHour:8},{key:'toHour',label:'To (h)',type:'number',min:0,max:23,step:0.5,val:p.toHour!==undefined?p.toHour:18}];
+        case'OUTPUT_LEVER':return[{key:'leverName',label:'Lever',type:'select',opts:leverOpts,val:p.leverName},{key:'leverState',label:'Set to',type:'select',opts:onOff,val:p.leverState||'on'},{key:'springReturn',label:'Spring return',type:'boolean',val:p.springReturn!==false}];
+        default:return[];
+    }
+}
+function fbdDrawParamPanel(ctx,node){
+    var defs=fbdParamDefs(node);if(!defs.length)return;
+    var PAD=8,ROW_H=24,LABEL_W=78,PW=FBD_W+20,PH=PAD+defs.length*ROW_H+PAD;
+    var px=node.x-10,py=node.y+fbdNodeH(node.type)+6;
+    fbdRoundRect(ctx,px,py,PW,PH,5);ctx.fillStyle='rgba(13,17,23,0.93)';ctx.fill();
+    ctx.strokeStyle='#4d9fff';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.fillStyle='#4d9fff';ctx.font='bold 8px Consolas,monospace';ctx.textAlign='left';ctx.textBaseline='top';
+    ctx.fillText('PARAMS',px+PAD,py+3);
+    defs.forEach(function(def,i){
+        var ry=py+PAD+i*ROW_H,valX=px+PAD+LABEL_W,valW=PW-PAD-LABEL_W-PAD,valH=ROW_H-6;
+        ctx.fillStyle='#8b949e';ctx.font='9px Consolas,monospace';ctx.textAlign='left';ctx.textBaseline='middle';
+        ctx.fillText(def.label,px+PAD,ry+ROW_H/2);
+        ctx.fillStyle='rgba(255,255,255,0.07)';ctx.strokeStyle='rgba(255,255,255,0.22)';ctx.lineWidth=1;
+        ctx.fillRect(valX,ry+3,valW,valH);ctx.strokeRect(valX,ry+3,valW,valH);
+        if(def.type==='boolean'){
+            ctx.fillStyle=def.val?'#007a30':'#3a3a3a';ctx.fillRect(valX+2,ry+5,valW-4,valH-4);
+            ctx.fillStyle='#e6edf3';ctx.font='9px Consolas,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+            ctx.fillText(def.val?'ON':'OFF',valX+valW/2,ry+ROW_H/2);
+        } else {
+            var dv=def.type==='select'?(def.opts&&def.opts.find(function(o){return o[0]===def.val;}))||(def.val!==undefined?[def.val,String(def.val)]:[['','']]):null;
+            var dispStr=def.type==='select'?(dv?dv[1]:String(def.val)):String(def.val!==undefined?def.val:'');
+            ctx.fillStyle='#e6edf3';ctx.font='9px Consolas,monospace';ctx.textAlign='left';ctx.textBaseline='middle';
+            ctx.fillText(String(dispStr).substring(0,16),valX+3,ry+ROW_H/2);
+        }
+        FBD.paramInputs.push({nodeId:node.id,key:def.key,type:def.type,opts:def.opts,min:def.min,max:def.max,step:def.step,val:def.val,x:valX,y:ry+3,w:valW,h:valH});
+    });
+}
+function fbdRemoveInlineInput(el){if(!el)return;try{if(el.parentNode)el.parentNode.removeChild(el);}catch(ex){}}
+function fbdShowInlineInput(pi){
+    if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}
+    if(!FBD.canvas)return;
+    var rect=FBD.canvas.getBoundingClientRect();
+    var sx=Math.round(pi.x*FBD.zoom+FBD.pan.x+rect.left),sy=Math.round(pi.y*FBD.zoom+FBD.pan.y+rect.top);
+    var sw=Math.max(40,Math.round(pi.w*FBD.zoom))+4,sh=Math.max(16,Math.round(pi.h*FBD.zoom))+2;
+    var baseStyle='position:fixed;z-index:9999;font-size:'+Math.max(9,Math.round(11*FBD.zoom))+'px;font-family:Consolas,monospace;background:#1a1f2e;color:#e6edf3;border:1px solid #4d9fff;border-radius:2px;padding:1px 3px;left:'+sx+'px;top:'+sy+'px;width:'+sw+'px;height:'+sh+'px;outline:none';
+    if(pi.type==='boolean'){
+        var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});
+        if(rule){var node=rule.fbd.nodes.find(function(n){return n.id===pi.nodeId;});if(node){if(!node.params)node.params={};node.params[pi.key]=!pi.val;saveRules();fbdRefreshSidebar(rule);fbdDrawCanvas();}}
+        return;
+    }
+    var el;
+    if(pi.type==='select'){
+        el=document.createElement('select');el.style.cssText=baseStyle;
+        (pi.opts||[]).forEach(function(o){var opt=document.createElement('option');opt.value=o[0];opt.textContent=o[1];if(o[0]===pi.val)opt.selected=true;el.appendChild(opt);});
+        el.addEventListener('change',function(){TAC._fbdUpdateParam(FBD.ruleId,pi.nodeId,pi.key,el.value);fbdRemoveInlineInput(el);FBD.inlineInput=null;});
+        el.addEventListener('blur',function(){if(el.parentNode){fbdRemoveInlineInput(el);FBD.inlineInput=null;fbdDrawCanvas();}});
+    } else {
+        el=document.createElement('input');el.type='number';el.value=pi.val;
+        if(pi.min!==undefined)el.min=pi.min;if(pi.max!==undefined)el.max=pi.max;if(pi.step!==undefined)el.step=pi.step;
+        el.style.cssText=baseStyle;
+        el.addEventListener('keydown',function(ev){if(ev.key==='Enter'||ev.key==='Tab'){ev.preventDefault();TAC._fbdUpdateParam(FBD.ruleId,pi.nodeId,pi.key,+el.value);fbdRemoveInlineInput(el);FBD.inlineInput=null;}if(ev.key==='Escape'){fbdRemoveInlineInput(el);FBD.inlineInput=null;fbdDrawCanvas();}});
+        el.addEventListener('blur',function(){if(el.parentNode){TAC._fbdUpdateParam(FBD.ruleId,pi.nodeId,pi.key,+el.value);fbdRemoveInlineInput(el);FBD.inlineInput=null;}});
+    }
+    document.body.appendChild(el);FBD.inlineInput=el;el.focus();if(el.select)el.select();
+}
+
+// ── FBD canvas draw ───────────────────────────────────────────────────────────
+function fbdRoundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
+}
+function fbdDrawWire(ctx, x0, y0, x1, y1, signal, dashed) {
+    var cx=Math.max(40,Math.abs(x1-x0)*0.45);
+    ctx.beginPath();ctx.moveTo(x0,y0);ctx.bezierCurveTo(x0+cx,y0,x1-cx,y1,x1,y1);
+    ctx.strokeStyle=dashed?'rgba(255,255,255,.45)':signal===true?'#00cc00':signal===false?'#3a6080':'#557';
+    ctx.lineWidth=dashed?1.5:2;ctx.setLineDash(dashed?[5,4]:[]);ctx.stroke();ctx.setLineDash([]);
+}
+function fbdDrawPin(ctx, x, y, isInput, label, signal) {
+    // Hover highlight — cyan glow ring when mouse is within hit radius
+    var mx=FBD.mouse?FBD.mouse.x:null, my=FBD.mouse?FBD.mouse.y:null;
+    if(mx!==null && Math.hypot(mx-x, my-y) < FBD_PR_HIT) {
+        ctx.beginPath();ctx.arc(x,y,FBD_PR+4,0,Math.PI*2);
+        ctx.strokeStyle='rgba(0,220,255,.75)';ctx.lineWidth=2;ctx.stroke();
+    }
+    ctx.beginPath();ctx.arc(x,y,FBD_PR,0,Math.PI*2);ctx.fillStyle=signal===true?'#00aa00':signal===false?'#2a2a2a':'#1a3a5a';ctx.fill();ctx.strokeStyle='rgba(255,255,255,.3)';ctx.lineWidth=1;ctx.stroke();
+    ctx.fillStyle='#c9d1d9';ctx.font='9px Consolas,monospace';ctx.textBaseline='middle';
+    if(isInput){ctx.textAlign='left';ctx.fillText(label,x+FBD_PR+3,y);}else{ctx.textAlign='right';ctx.fillText(label,x-FBD_PR-3,y);}
+}
+function fbdDrawNode(ctx, node, selected) {
+    var d=FBD_DEFS[node.type];if(!d)return;var h=fbdNodeH(node.type);
+    fbdRoundRect(ctx,node.x,node.y,FBD_W,h,6);ctx.fillStyle=d.color;ctx.fill();
+    ctx.strokeStyle=selected?'#4d9fff':'rgba(255,255,255,.18)';ctx.lineWidth=selected?2:1;ctx.stroke();
+    ctx.strokeStyle='rgba(255,255,255,.12)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(node.x,node.y+FBD_HEAD);ctx.lineTo(node.x+FBD_W,node.y+FBD_HEAD);ctx.stroke();
+    ctx.fillStyle='#e6edf3';ctx.font='bold 11px Consolas,monospace';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(d.label,node.x+FBD_W/2,node.y+FBD_HEAD/2);
+    var summary=fbdNodeParamSummary(node);if(summary){ctx.fillStyle='rgba(200,210,220,.6)';ctx.font='9px Consolas,monospace';var bodyH=h-FBD_HEAD;ctx.fillText(summary.substring(0,20),node.x+FBD_W/2,node.y+FBD_HEAD+bodyH/2);}
+    for(var i=0;i<d.inputs.length;i++){var ip=fbdPinPos(node,true,i);fbdDrawPin(ctx,ip.x,ip.y,true,d.inputs[i],S.fbdSignals[node.id+'_in_'+d.inputs[i]]);}
+    for(var j=0;j<d.outputs.length;j++){var op=fbdPinPos(node,false,j);fbdDrawPin(ctx,op.x,op.y,false,d.outputs[j],S.fbdSignals[node.id+'_'+d.outputs[j]]);}
+    if(selected)fbdDrawParamPanel(ctx,node);
+}
+function fbdDrawCanvas() {
+    FBD.paramInputs=[];
+    if(!FBD.canvas||!FBD.ctx)return;
+    var ctx=FBD.ctx,W=FBD.canvas.width,H=FBD.canvas.height;
+    var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});if(!rule||!rule.fbd)return;
+    var nodes=rule.fbd.nodes,edges=rule.fbd.edges;
+    ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d1117';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='rgba(255,255,255,.05)';var gs=24*FBD.zoom,ox=((FBD.pan.x%gs)+gs)%gs,oy=((FBD.pan.y%gs)+gs)%gs;
+    for(var gx=ox;gx<W;gx+=gs)for(var gy=oy;gy<H;gy+=gs)ctx.fillRect(gx,gy,1.5,1.5);
+    ctx.save();ctx.translate(FBD.pan.x,FBD.pan.y);ctx.scale(FBD.zoom,FBD.zoom);
+    edges.forEach(function(e){var fn=nodes.find(function(n){return n.id===e.fromNodeId;});var tn=nodes.find(function(n){return n.id===e.toNodeId;});if(!fn||!tn)return;var fd=FBD_DEFS[fn.type],td=FBD_DEFS[tn.type];if(!fd||!td)return;var fi=fd.outputs.indexOf(e.fromPin),ti=td.inputs.indexOf(e.toPin);if(fi<0||ti<0)return;var p0=fbdPinPos(fn,false,fi),p1=fbdPinPos(tn,true,ti);fbdDrawWire(ctx,p0.x,p0.y,p1.x,p1.y,S.fbdSignals[fn.id+'_'+e.fromPin]);});
+    if(FBD.wire){
+        // Draw wire to snap target if one exists, otherwise follow mouse
+        var tipX=FBD.mouse.x, tipY=FBD.mouse.y;
+        if(FBD.snapTarget){tipX=FBD.snapTarget.pos.x;tipY=FBD.snapTarget.pos.y;}
+        fbdDrawWire(ctx,FBD.wire.x0,FBD.wire.y0,tipX,tipY,null,true);
+        // Draw snap indicator ring on the target pin
+        if(FBD.snapTarget){
+            var sp=FBD.snapTarget.pos;
+            ctx.beginPath();ctx.arc(sp.x,sp.y,FBD_PR+7,0,Math.PI*2);
+            ctx.strokeStyle='rgba(0,220,255,0.9)';ctx.lineWidth=2.5;ctx.stroke();
+            ctx.beginPath();ctx.arc(sp.x,sp.y,FBD_PR+14,0,Math.PI*2);
+            ctx.strokeStyle='rgba(0,220,255,0.25)';ctx.lineWidth=1.5;ctx.stroke();
+        }
+    }
+    nodes.forEach(function(node){fbdDrawNode(ctx,node,node.id===FBD.selected);});
+    ctx.restore();
+    // Capture thumbnail for rule list display (transient — stripped by saveRules _-key filter)
+    try{rule._fbdThumb=FBD.canvas.toDataURL('image/jpeg',0.55);}catch(ex){}
+}
+
+// Pin snap: finds the closest input pin within FBD_SNAP_RADIUS world-units.
+// Only snaps to input pins on nodes other than the wire's source node.
+var FBD_SNAP_RADIUS = 300;
+function fbdSnapTarget(wx, wy, nodes, fromNodeId) {
+    var best=null, bestDist=FBD_SNAP_RADIUS;
+    for(var i=0;i<nodes.length;i++){
+        var n=nodes[i];if(n.id===fromNodeId)continue;
+        var d=FBD_DEFS[n.type];if(!d||!d.inputs.length)continue;
+        for(var j=0;j<d.inputs.length;j++){
+            var p=fbdPinPos(n,true,j);
+            var dist=Math.hypot(wx-p.x,wy-p.y);
+            if(dist<bestDist){bestDist=dist;best={node:n,pin:d.inputs[j],pos:p,dist:bestDist,isInput:true};}
+        }
+    }
+    return best;
+}
+
+// ── FBD canvas events ──────────────────────────────────────────────────────────
+function fbdOnMouseDown(e) {
+    fbdHideContextMenu();
+    var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});if(!rule)return;
+    var w=fbdScreenToWorld(e.clientX,e.clientY);FBD.mouse=w;
+    if(e.button===1||(e.button===0&&FBD.spaceDown)){FBD.panning=true;FBD.panStart={mx:e.clientX,my:e.clientY,px:FBD.pan.x,py:FBD.pan.y};e.preventDefault();return;}
+    if(e.button!==0)return;
+    if(FBD.paramInputs.length&&FBD.selected){for(var _i=0;_i<FBD.paramInputs.length;_i++){var _pi=FBD.paramInputs[_i];if(w.x>=_pi.x&&w.x<=_pi.x+_pi.w&&w.y>=_pi.y&&w.y<=_pi.y+_pi.h){fbdShowInlineInput(_pi);e.preventDefault();return;}}}
+    var pin=fbdPinAt(w.x,w.y,rule.fbd.nodes);
+    if(pin&&!pin.isInput){var d=FBD_DEFS[pin.node.type];var pidx=d?d.outputs.indexOf(pin.pin):0;var pp=fbdPinPos(pin.node,false,Math.max(0,pidx));FBD.wire={fromNodeId:pin.node.id,fromPin:pin.pin,x0:pp.x,y0:pp.y};return;}
+    var node=fbdNodeAt(w.x,w.y,rule.fbd.nodes);
+    if(node){if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}FBD.selected=node.id;FBD.drag={nodeId:node.id,offX:w.x-node.x,offY:w.y-node.y};fbdRefreshSidebar(rule);fbdDrawCanvas();return;}
+    FBD.selected=null;if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}fbdRefreshSidebar(rule);fbdDrawCanvas();
+}
+function fbdOnMouseMove(e) {
+    var w=fbdScreenToWorld(e.clientX,e.clientY);FBD.mouse=w;
+    if(FBD.panning){FBD.pan.x=FBD.panStart.px+(e.clientX-FBD.panStart.mx);FBD.pan.y=FBD.panStart.py+(e.clientY-FBD.panStart.my);fbdDrawCanvas();return;}
+    if(FBD.drag){var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});if(rule){var node=rule.fbd.nodes.find(function(n){return n.id===FBD.drag.nodeId;});if(node){node.x=Math.round(w.x-FBD.drag.offX);node.y=Math.round(w.y-FBD.drag.offY);}}fbdDrawCanvas();return;}
+    if(FBD.wire){
+        // Compute snap target — closest input pin within 300px
+        var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});
+        FBD.snapTarget=rule?fbdSnapTarget(w.x,w.y,rule.fbd.nodes,FBD.wire.fromNodeId):null;
+    } else {
+        FBD.snapTarget=null;
+    }
+    fbdDrawCanvas();
+}
+function fbdOnMouseUp(e) {
+    if(FBD.panning){FBD.panning=false;FBD.panStart=null;return;}
+    if(FBD.drag){var rule0=S.rules.find(function(r){return r.id===FBD.ruleId;});if(rule0)saveRules();FBD.drag=null;return;}
+    if(FBD.wire&&e.button===0){
+        var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});
+        if(rule){
+            // Prefer snap target over exact pin hit — snap wins within 300px
+            var snapPin=FBD.snapTarget;
+            var w=fbdScreenToWorld(e.clientX,e.clientY);
+            var hitPin=snapPin||fbdPinAt(w.x,w.y,rule.fbd.nodes);
+            if(hitPin&&hitPin.isInput&&hitPin.node.id!==FBD.wire.fromNodeId){
+                fbdPushUndo(rule);
+                // Remove any existing edge going into this input pin (one edge per input)
+                rule.fbd.edges=rule.fbd.edges.filter(function(ed){return!(ed.toNodeId===hitPin.node.id&&ed.toPin===hitPin.pin);});
+                rule.fbd.edges.push({id:fbdMakeEdgeId(),fromNodeId:FBD.wire.fromNodeId,fromPin:FBD.wire.fromPin,toNodeId:hitPin.node.id,toPin:hitPin.pin});
+                saveRules();
+            }
+        }
+        FBD.wire=null;FBD.snapTarget=null;fbdDrawCanvas();return;
+    }
+    FBD.wire=null;FBD.snapTarget=null;
+}
+function fbdOnContextMenu(e) {
+    e.preventDefault();var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});if(!rule)return;
+    var w=fbdScreenToWorld(e.clientX,e.clientY);
+    var node=fbdNodeAt(w.x,w.y,rule.fbd.nodes);
+    if(node){
+        fbdPushUndo(rule);
+        if(FBD.selected===node.id)FBD.selected=null;
+        if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}
+        rule.fbd.nodes=rule.fbd.nodes.filter(function(n){return n.id!==node.id;});
+        rule.fbd.edges=rule.fbd.edges.filter(function(ed){return ed.fromNodeId!==node.id&&ed.toNodeId!==node.id;});
+        saveRules();fbdDrawCanvas();return;
+    }
+    var edge=fbdHitEdge(w.x,w.y,rule.fbd.nodes,rule.fbd.edges);
+    if(edge){fbdPushUndo(rule);rule.fbd.edges=rule.fbd.edges.filter(function(ed){return ed.id!==edge.id;});saveRules();fbdDrawCanvas();return;}
+    // Empty canvas — show ComfyUI-style node picker
+    fbdShowContextMenu(e,w.x,w.y);
+}
+function fbdOnWheel(e){
+    e.preventDefault();
+    var factor=e.deltaY<0?1.1:(1/1.1);
+    var r=FBD.canvas.getBoundingClientRect();
+    var mx=e.clientX-r.left,my=e.clientY-r.top;
+    FBD.pan.x=mx-(mx-FBD.pan.x)*factor;
+    FBD.pan.y=my-(my-FBD.pan.y)*factor;
+    FBD.zoom=Math.max(0.1,Math.min(4,FBD.zoom*factor));
+    fbdDrawCanvas();
+}
+function fbdFitToScreen(){
+    var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});
+    if(!rule||!rule.fbd.nodes.length||!FBD.canvas)return;
+    var nodes=rule.fbd.nodes,minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    nodes.forEach(function(n){minX=Math.min(minX,n.x);minY=Math.min(minY,n.y);maxX=Math.max(maxX,n.x+FBD_W);maxY=Math.max(maxY,n.y+fbdNodeH(n.type));});
+    var W=FBD.canvas.width,H=FBD.canvas.height,M=40;
+    var zx=(W-M*2)/Math.max(1,maxX-minX),zy=(H-M*2)/Math.max(1,maxY-minY);
+    FBD.zoom=Math.max(0.1,Math.min(2,Math.min(zx,zy)));
+    FBD.pan.x=M-minX*FBD.zoom;FBD.pan.y=M-minY*FBD.zoom;
+    fbdDrawCanvas();
+}
+function fbdHideContextMenu(){var el=document.getElementById('tac-fbd-ctx-menu');if(el)el.remove();}
+function fbdShowContextMenu(e,wx,wy){
+    fbdHideContextMenu();
+    var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});if(!rule)return;
+    var menu=document.createElement('div');menu.id='tac-fbd-ctx-menu';
+    menu.style.cssText='position:fixed;z-index:9997;background:#1a1f2e;border:1px solid rgba(255,255,255,.22);border-radius:.375rem;padding:.35rem;min-width:195px;max-height:380px;overflow-y:auto;box-shadow:0 6px 20px rgba(0,0,0,.65)';
+    menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-390)+'px';
+    var si=document.createElement('input');si.type='text';si.placeholder='Search nodes\u2026';
+    si.style.cssText='width:100%;background:#0d1117;border:1px solid rgba(255,255,255,.18);border-radius:.2rem;color:#e6edf3;padding:.2rem .4rem;font-size:.8rem;outline:none;box-sizing:border-box;margin-bottom:.3rem';
+    menu.appendChild(si);
+    var nd=document.createElement('div');nd.id='tac-fbd-ctx-nodes';
+    var cats=['Input','Logic','Output'],byC={};
+    Object.keys(FBD_DEFS).forEach(function(t){var c=FBD_DEFS[t].cat;if(!byC[c])byC[c]=[];byC[c].push(t);});
+    function rebuild(f){
+        nd.innerHTML='';f=f?f.toLowerCase():'';
+        cats.forEach(function(cat){
+            var list=(byC[cat]||[]).filter(function(t){return!f||FBD_DEFS[t].label.toLowerCase().indexOf(f)>=0||t.toLowerCase().indexOf(f)>=0;});
+            if(!list.length)return;
+            var cl=document.createElement('div');cl.style.cssText='color:#6e7681;font-size:.68rem;font-weight:600;text-transform:uppercase;padding:.15rem .35rem;margin-top:.15rem';cl.textContent=cat;nd.appendChild(cl);
+            list.forEach(function(type){
+                var d=FBD_DEFS[type];
+                var btn=document.createElement('button');btn.type='button';
+                btn.style.cssText='width:100%;text-align:left;background:transparent;border:none;color:#e6edf3;padding:.2rem .5rem;font-size:.8rem;cursor:pointer;border-radius:.2rem;display:block';
+                btn.textContent=d.label+(d.needsDll&&DLL_AVAILABLE===false?' \u26a0':'');
+                btn.onmouseover=function(){btn.style.background='rgba(255,255,255,.09)';};
+                btn.onmouseout=function(){btn.style.background='transparent';};
+                btn.onclick=function(){
+                    fbdHideContextMenu();
+                    fbdPushUndo(rule);
+                    var node={id:fbdMakeNodeId(),type:type,x:Math.round(wx),y:Math.round(wy),params:fbdDefaultParams(type)};
+                    rule.fbd.nodes.push(node);FBD.selected=node.id;saveRules();fbdDrawCanvas();
+                };
+                nd.appendChild(btn);
+            });
+        });
+    }
+    rebuild('');menu.appendChild(nd);document.body.appendChild(menu);
+    setTimeout(function(){si.focus();si.addEventListener('input',function(){rebuild(si.value);});},10);
+    // Close on outside click
+    function onOutside(ev){if(!menu.contains(ev.target)){fbdHideContextMenu();document.removeEventListener('mousedown',onOutside,true);}}
+    document.addEventListener('mousedown',onOutside,true);
+}
+function fbdOnKeyDown(e){
+    if(e.code==='Space'&&e.target.tagName!=='INPUT'&&e.target.tagName!=='TEXTAREA'){FBD.spaceDown=true;e.preventDefault();}
+    if((e.key==='Delete'||e.key==='Backspace')&&FBD.selected&&e.target.tagName!=='INPUT'&&e.target.tagName!=='TEXTAREA'){TAC._fbdDeleteNode(FBD.ruleId,FBD.selected);e.preventDefault();}
+    if((e.key==='f'||e.key==='F')&&e.target.tagName!=='INPUT'&&e.target.tagName!=='TEXTAREA'){fbdFitToScreen();}
+    if(e.key==='z'&&(e.ctrlKey||e.metaKey)&&e.target.tagName!=='INPUT'&&e.target.tagName!=='TEXTAREA'){var rule=S.rules.find(function(r){return r.id===FBD.ruleId;});if(rule)fbdUndo(rule);e.preventDefault();}
+}
+function fbdOnKeyUp(e){if(e.code==='Space')FBD.spaceDown=false;}
+
+function attachFbdCanvas(rule) {
+    var canvas=document.getElementById('tac-fbd-canvas');if(!canvas)return;
+    if(FBD.canvas){FBD.canvas.removeEventListener('mousedown',fbdOnMouseDown);FBD.canvas.removeEventListener('mousemove',fbdOnMouseMove);FBD.canvas.removeEventListener('mouseup',fbdOnMouseUp);FBD.canvas.removeEventListener('contextmenu',fbdOnContextMenu);FBD.canvas.removeEventListener('wheel',fbdOnWheel);}
+    document.removeEventListener('keydown',fbdOnKeyDown);document.removeEventListener('keyup',fbdOnKeyUp);
+    var wrap=canvas.parentElement;canvas.width=wrap?Math.max(400,wrap.clientWidth-4):700;canvas.height=560;
+    FBD.canvas=canvas;FBD.ctx=canvas.getContext('2d');
+    if(FBD.ruleId!==rule.id){if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}FBD.pan={x:20,y:20};FBD.zoom=1.0;FBD.selected=null;FBD.wire=null;}
+    FBD.ruleId=rule.id;
+    canvas.addEventListener('mousedown',fbdOnMouseDown);canvas.addEventListener('mousemove',fbdOnMouseMove);canvas.addEventListener('mouseup',fbdOnMouseUp);canvas.addEventListener('contextmenu',fbdOnContextMenu);canvas.addEventListener('wheel',fbdOnWheel,{passive:false});
+    document.addEventListener('keydown',fbdOnKeyDown);document.addEventListener('keyup',fbdOnKeyUp);
+    fbdDrawCanvas();
+}
+function fbdDetach() {
+    fbdHideContextMenu();
+    if(FBD.canvas){FBD.canvas.removeEventListener('mousedown',fbdOnMouseDown);FBD.canvas.removeEventListener('mousemove',fbdOnMouseMove);FBD.canvas.removeEventListener('mouseup',fbdOnMouseUp);FBD.canvas.removeEventListener('contextmenu',fbdOnContextMenu);FBD.canvas.removeEventListener('wheel',fbdOnWheel);FBD.canvas=null;FBD.ctx=null;}
+    document.removeEventListener('keydown',fbdOnKeyDown);document.removeEventListener('keyup',fbdOnKeyUp);
+    if(FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}FBD.wire=null;FBD.snapTarget=null;FBD.drag=null;FBD.panning=false;FBD.spaceDown=false;
+}
+function fbdRefreshSidebar(rule){var el=document.getElementById('tac-fbd-sidebar');if(el)el.innerHTML=renderFbdSidebar(rule);}
+
+// ── FBD render ────────────────────────────────────────────────────────────────
+function renderFbdEditor(rule) {
+    var rid=esc(rule.id);
+    return '<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem">'
+         + '<span class="text-muted" style="font-size:.72rem">\uD83D\uDDA5\ufe0f Right-click canvas to add nodes \u2022 Drag output\u25ba to input pin to wire \u2022 Right-click node/edge to delete \u2022 Scroll to zoom \u2022 Space+drag to pan \u2022 <kbd>Delete</kbd>=remove node \u2022 <kbd>F</kbd>=fit all \u2022 <kbd>Ctrl+Z</kbd>=undo</span>'
+         + '<button type="button" class="btn btn-sm btn-outline-secondary ms-auto py-0 px-2" style="font-size:.75rem;flex-shrink:0" onclick="TAC._fbdOpenFullscreen(\''+rid+'\')">\u2b06 Fullscreen</button>'
+         + '</div>'
+         + '<canvas id="tac-fbd-canvas" style="background:#0d1117;border:1px solid rgba(255,255,255,.15);border-radius:.375rem;cursor:crosshair;width:100%;display:block"></canvas>';
+}
+function renderFbdSidebar(rule) {
+    var rid=esc(rule.id),cats=['Input','Logic','Output'],byCategory={};
+    Object.keys(FBD_DEFS).forEach(function(type){var c=FBD_DEFS[type].cat;if(!byCategory[c])byCategory[c]=[];byCategory[c].push(type);});
+    var lib='<div class="fw-semibold text-muted mb-2" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em">Node Library</div>';
+    cats.forEach(function(cat){
+        lib+='<div class="text-muted mb-1" style="font-size:.68rem;font-weight:600;text-transform:uppercase">'+cat+'</div>';
+        (byCategory[cat]||[]).forEach(function(type){
+            var d=FBD_DEFS[type];
+            var dllNote = (d.needsDll && DLL_AVAILABLE===false) ? ' <span style="color:#ffc107;font-size:.65rem" title="DLL required">\u26a0</span>' : '';
+            lib+='<button type="button" class="btn btn-outline-secondary mb-1 text-start w-100 py-0 px-2" style="font-size:.75rem;height:24px;line-height:1" onclick="TAC._fbdAddNode(\''+rid+'\',\''+type+'\')">'
+                +d.label+dllNote+'</button>';
+        });
+        lib+='<div style="height:4px"></div>';
+    });
+    return lib;
+}
+function renderFbdNodeParams(rule, node) {
+    var rid=esc(rule.id),nid=esc(node.id),p=node.params||{};
+    var html='<div class="fw-semibold mb-2" style="font-size:.72rem;text-transform:uppercase">'+FBD_DEFS[node.type].label+'</div>';
+    function pRow(label,ctrl){return'<div class="mb-1"><div class="text-muted" style="font-size:.68rem">'+label+'</div>'+ctrl+'</div>';}
+    function mkSel(key,opts,cur){return'<select class="form-select form-select-sm" style="font-size:.75rem;height:26px;padding:.1rem .3rem" onchange="TAC._fbdUpdateParam(\''+rid+'\',\''+nid+'\',\''+key+'\',this.value)">'+opts.map(function(o){return'<option value="'+o[0]+'"'+(cur===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select>';}
+    function mkNum(key,cur,min,max,step){return'<input type="number" class="form-control form-control-sm" style="font-size:.75rem;height:26px" min="'+(min||0)+'" max="'+(max||9999)+'" step="'+(step||1)+'" value="'+(cur||0)+'" onchange="TAC._fbdUpdateParam(\''+rid+'\',\''+nid+'\',\''+key+'\',+this.value)">';}
+    var popF=[['totalBeavers','Total'],['adults','Adults'],['children','Children'],['unemployed','Idle'],['homeless','Homeless'],['injured','Injured'],['contaminated','Contam.']];
+    var opO=[['gt','>'],['gte','\u2265'],['lt','<'],['lte','\u2264'],['eq','=']];
+    switch(node.type){
+        case'INPUT_ADAPTER':html+=pRow('Adapter',mkSel('adapterName',S.adapters.length?S.adapters.map(function(a){return[a.name,a.name];}):[['',' — ']],p.adapterName));html+=pRow('State',mkSel('adapterState',[['on','ON'],['off','OFF']],p.adapterState||'on'));break;
+        case'INPUT_LEVER':html+=pRow('Lever',mkSel('leverName',S.levers.length?S.levers.map(function(l){return[l.name,l.name];}):[['',' — ']],p.leverName));html+=pRow('Is',mkSel('leverState',[['on','ON'],['off','OFF']],p.leverState||'on'));break;
+        case'INPUT_SENSOR':html+=pRow('Sensor',mkSel('sensorName',S.sensors.length?S.sensors.map(function(s){return[s.name,s.name];}):[['',' — no sensors — ']],p.sensorName));html+=pRow('Signal',mkSel('sensorState',[['on','ON (active)'],['off','OFF (inactive)']],p.sensorState||'on'));break;
+        case'INPUT_GAMESTATE':html+=pRow('Field',mkSel('field',[['isDay','Daytime'],['isNight','Nighttime'],['isDrought','Drought'],['isBadtide','Badtide'],['isHazardous','Hazardous (legacy)'],['weatherIsHazardous','Any Hazardous Weather']],p.field||'isDay'));break;
+        case'INPUT_TIME':html+=pRow('From (h)',mkNum('fromHour',p.fromHour,0,23,0.5));html+=pRow('To (h)',mkNum('toHour',p.toHour,0,23,0.5));break;
+        case'INPUT_POPULATION':case'LOGIC_COMPARE':html+=pRow('Field',mkSel('field',popF,p.field||'homeless'));html+=pRow('Operator',mkSel('op',opO,p.op||'gt'));html+=pRow('Threshold',mkNum('threshold',p.threshold,0,9999,1));break;
+        case'LOGIC_TIMER':html+=pRow('On Delay (s)',mkNum('preset',p.preset,1,3600,1));break;
+        case'LOGIC_TOF':  html+=pRow('Off Delay (s)',mkNum('preset',p.preset,1,3600,1));break;
+        case'LOGIC_TP':   html+=pRow('Pulse width (s)',mkNum('preset',p.preset,1,3600,1));break;
+        case'LOGIC_GEN':  html+=pRow('ON time (s)',mkNum('onTime',p.onTime,0.5,3600,0.5));html+=pRow('OFF time (s)',mkNum('offTime',p.offTime,0.5,3600,0.5));break;
+        case'LOGIC_CTU':  html+=pRow('Preset count',mkNum('preset',p.preset,1,9999,1));break;
+        case'LOGIC_RTC':  html+=pRow('From (h)',mkNum('fromHour',p.fromHour,0,23,0.5));html+=pRow('To (h)',mkNum('toHour',p.toHour,0,23,0.5));break;
+        case'OUTPUT_LEVER':html+=pRow('Lever',mkSel('leverName',S.levers.length?S.levers.map(function(l){return[l.name,l.name];}):[['',' — ']],p.leverName));html+=pRow('Set to',mkSel('leverState',[['on','ON'],['off','OFF']],p.leverState||'on'));html+=pRow('Spring return','<label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.78rem"><input type="checkbox" '+(p.springReturn!==false?'checked':'')+' onchange="TAC._fbdUpdateParam(\''+rid+'\',\''+nid+'\',\'springReturn\',this.checked)"> Auto-off when IN goes LOW</label>');break;
+        default:html+='<div class="text-muted small fst-italic">No parameters</div>';
+    }
+    html+='<button type="button" class="btn btn-sm btn-outline-danger w-100 mt-2" style="font-size:.75rem;padding:.15rem" onclick="TAC._fbdDeleteNode(\''+rid+'\',\''+nid+'\')">\u2715 Delete Node</button>';
+    return html;
+}
+
+// ── FBD engine ────────────────────────────────────────────────────────────────
+function runFbdRule(rule) {
+    if(!rule.fbd||!rule.fbd.nodes.length)return;
+    try {
+        var nodes=rule.fbd.nodes,edges=rule.fbd.edges,signals={};
+        var inDeg={};nodes.forEach(function(n){inDeg[n.id]=0;});edges.forEach(function(e){inDeg[e.toNodeId]=(inDeg[e.toNodeId]||0)+1;});
+        var queue=nodes.filter(function(n){return!inDeg[n.id];}).map(function(n){return n.id;}),order=[];
+        while(queue.length){var nid=queue.shift();order.push(nid);edges.filter(function(e){return e.fromNodeId===nid;}).forEach(function(e){inDeg[e.toNodeId]--;if(!inDeg[e.toNodeId])queue.push(e.toNodeId);});}
+        var now=Date.now();
+        order.forEach(function(nid){
+            var node=nodes.find(function(n){return n.id===nid;});if(!node)return;
+            var def=FBD_DEFS[node.type];if(!def)return;var p=node.params||{};
+            function getIn(pin){var edge=edges.find(function(e){return e.toNodeId===nid&&e.toPin===pin;});if(!edge)return false;return!!signals[edge.fromNodeId+'_'+edge.fromPin];}
+            var out=false;
+            switch(node.type){
+                case'INPUT_ADAPTER':{var a=S.adapters.find(function(x){return x.name===p.adapterName;});out=a?(p.adapterState==='on'?a.state===true:a.state===false):false;break;}
+                case'INPUT_LEVER':{var lv=S.levers.find(function(x){return x.name===p.leverName;});out=lv?(p.leverState==='on'?lv.state===true:lv.state===false):false;break;}
+                case'INPUT_SENSOR':{var sn=S.sensors.find(function(x){return x.name===p.sensorName;});out=sn?(p.sensorState==='on'?sn.isOn===true:sn.isOn===false):false;break;}
+                case'INPUT_GAMESTATE':{if(!S.gameState)break;var wId=(S.gameState.weatherId||'').toLowerCase();if(p.field==='isDrought'){out=wId==='drought'||!!S.gameState.isDrought;}else if(p.field==='isBadtide'){out=wId==='badtide'||!!S.gameState.isBadtide;}else if(p.field==='isHazardous'||p.field==='weatherIsHazardous'){out=!!S.gameState.weatherIsHazardous||!!S.gameState.isHazardous;}else{out=!!S.gameState[p.field];}break;}
+                case'INPUT_TIME':{if(!S.gameState)break;var h=S.gameState.timeOfDayHours,fr=p.fromHour||0,to=p.toHour||12;out=fr<=to?(h>=fr&&h<to):(h>=fr||h<to);break;}
+                case'INPUT_POPULATION':case'LOGIC_COMPARE':{if(!S.population)break;var val=S.population[p.field];if(val===undefined)break;var thr=p.threshold||0;switch(p.op){case'gt':out=val>thr;break;case'gte':out=val>=thr;break;case'lt':out=val<thr;break;case'lte':out=val<=thr;break;case'eq':out=val===thr;break;}break;}
+                case'ALWAYS_HIGH': out=true;break;
+                case'ALWAYS_LOW':  out=false;break;
+                case'LOGIC_AND':   out=getIn('A')&&getIn('B');break;
+                case'LOGIC_OR':    out=getIn('A')||getIn('B');break;
+                case'LOGIC_NAND':  out=!(getIn('A')&&getIn('B'));break;
+                case'LOGIC_NOR':   out=!(getIn('A')||getIn('B'));break;
+                case'LOGIC_NOT':   out=!getIn('IN');break;
+                case'LOGIC_TIMER':{var inSig=getIn('IN');if(!inSig){node._timerStart=null;out=false;}else{if(!node._timerStart)node._timerStart=now;out=(now-node._timerStart)>=(p.preset||10)*1000;}break;}
+                case'LOGIC_TOF':{// Off Delay: HIGH immediately on IN=true; stays HIGH for preset ms after IN goes false
+                    var inSig=getIn('IN');
+                    if(inSig){node._tofStart=null;out=true;}
+                    else if(!node._tofStart){node._tofStart=now;out=true;}
+                    else{out=(now-node._tofStart)<(p.preset||10)*1000;}
+                    break;}
+                case'LOGIC_TP':{// Pulse: fixed-length pulse on rising edge of IN
+                    var inSig=getIn('IN');
+                    if(inSig&&!node._prevIn){node._pulseStart=now;}
+                    node._prevIn=inSig;
+                    out=!!(node._pulseStart)&&(now-node._pulseStart)<(p.preset||5)*1000;
+                    if(!out&&node._pulseStart&&(now-node._pulseStart)>=(p.preset||5)*1000)node._pulseStart=null;
+                    break;}
+                case'LOGIC_GEN':{// Gated oscillator — cycles only while IN is HIGH
+                    var genIn=getIn('IN');
+                    if(!genIn){node._genStart=null;out=false;break;}
+                    if(!node._genStart)node._genStart=now;
+                    var period=((p.onTime||5)+(p.offTime||5))*1000;
+                    var phase=(now-node._genStart)%period;
+                    out=phase<(p.onTime||5)*1000;
+                    break;}
+                case'LOGIC_CTU':{// Up counter: count rising edges on CU, reset on R, Q=count>=preset
+                    var cu=getIn('CU'),rst=getIn('R');
+                    if(rst){node._count=0;}
+                    else if(cu&&!node._prevCU){node._count=(node._count||0)+1;}
+                    node._prevCU=cu;
+                    out=(node._count||0)>=(p.preset||5);
+                    break;}
+                case'LOGIC_RTC':{// Real-Time Clock window using browser time
+                    var d=new Date(),h=d.getHours()+d.getMinutes()/60;
+                    var fr=p.fromHour!==undefined?p.fromHour:8,to=p.toHour!==undefined?p.toHour:18;
+                    out=fr<=to?(h>=fr&&h<to):(h>=fr||h<to);
+                    break;}
+                case'LOGIC_SRLATCH':{var Si=getIn('S'),Ri=getIn('R');if(Ri)node._latchQ=false;if(Si)node._latchQ=true;out=!!node._latchQ;break;}
+                case'OUTPUT_LEVER':{var inVal=getIn('IN');
+                    if(inVal&&p.leverName){
+                        // IN is HIGH — apply the configured action (ON or OFF)
+                        applyActions([{leverName:p.leverName,leverState:p.leverState||'on'}]);
+                    } else if(!inVal&&p.leverName&&p.springReturn!==false){
+                        // IN is LOW and spring-return enabled — send inverse state
+                        var inverseState=(p.leverState==='on')?'off':'on';
+                        applyActions([{leverName:p.leverName,leverState:inverseState}]);
+                    }
+                    out=inVal;break;}
+            }
+            def.outputs.forEach(function(pin){signals[nid+'_'+pin]=out;});
+            def.inputs.forEach(function(pin){signals[nid+'_in_'+pin]=getIn(pin);});
+        });
+        S.fbdSignals=signals;
+        rule._lastError=null;
+    } catch(e) {
+        rule._lastError = e.message || String(e);
+    }
+}
+
+// ── Persistence ───────────────────────────────────────────────────────────────
+function makeRule(name, mode) {
+    var ts=Date.now(),rnd=Math.floor(Math.random()*1000);
+    return{id:'r_'+ts+'_'+rnd,name:name||'New Rule',enabled:true,mode:mode||'simple',simple:{conditionMode:'and',functionType:'direct',timerSeconds:10,conditions:[],actions:[]},fbd:{nodes:[],edges:[]},code:{script:'// Available read-only: adapters, levers, gameState, population\n// setLever(name, \'on\'|\'off\')  \u2014  log(msg)\n\n'}};
+}
+function migrateV2Rule(old) {
+    var r=makeRule(old.adapterName+' \u2192 '+old.leverName,'simple');r.enabled=!!old.enabled;r.simple.conditions=[{type:'adapter',adapterName:old.adapterName,adapterState:old.adapterState}];r.simple.actions=[{leverName:old.leverName,leverState:old.leverState}];return r;
+}
+function loadRules() {
+    try{var v3=JSON.parse(localStorage.getItem('tac_rules_v3')||'null');if(Array.isArray(v3)&&v3.length)return v3;}catch(e){}
+    try{var v2=JSON.parse(localStorage.getItem('tac_rules_v2')||'null');if(Array.isArray(v2)&&v2.length){var m=v2.map(migrateV2Rule);try{localStorage.setItem('tac_rules_v3',JSON.stringify(m));}catch(e){}return m;}}catch(e){}
+    return[];
+}
+var _saveTimer = null;
+function saveRules() {
+    try { localStorage.setItem('tac_rules_v3', JSON.stringify(S.rules)); } catch(e) {}
+    // Debounced server POST — only when a save is loaded
+    if(S.currentSaveName) {
+        clearTimeout(_saveTimer);
+        _saveTimer = setTimeout(function() {
+            if(!S.currentSaveName) return;
+            var body = JSON.stringify(
+                {rules: S.rules},
+                function(k,v) { return (typeof k === 'string' && k.charAt(0) === '_') ? undefined : v; }
+            );
+            fetch('/api/automation?save=' + encodeURIComponent(S.currentSaveName), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: body
+            }).then(function(r) {
+                if(r.ok) uiLog('sync', 'Rules synced to server for "' + S.currentSaveName + '" (' + S.rules.length + ' rules)');
+                else     uiLog('warn', 'Server sync failed: HTTP ' + r.status + ' for "' + S.currentSaveName + '"');
+            }).catch(function(e) { uiLog('warn', 'Server sync error: ' + (e.message||e)); });
+        }, 500);
+    }
+}
+
+// Called when poll detects a new/changed saveName from /api/gamestate.
+// Fetches the rule set for that save from the backend.
+// If the server has no rules yet (first time), migrates current in-memory rules to it.
+function loadRulesFromServer(saveName) {
+    S.currentSaveName = saveName;
+    var snel = document.getElementById('tac-savename');
+    if(snel) snel.textContent = '\uD83D\uDCBE ' + saveName;
+    uiLog('sync', 'Save detected: "' + saveName + '" \u2014 fetching rules from server\u2026');
+    get('/api/automation?save=' + encodeURIComponent(saveName)).then(function(data) {
+        // Server returns {rules:[...]} — handle both wrapped and raw array just in case
+        var loaded = Array.isArray(data) ? data
+                   : (data && Array.isArray(data.rules)) ? data.rules
+                   : null;
+        if(loaded === null) { uiLog('warn', 'Server returned unexpected format for save "' + saveName + '"'); return; }
+        if(loaded.length > 0) {
+            // Fill in any missing sub-objects so old saves don't crash the engine
+            S.rules = loaded.map(function(r) { return Object.assign({}, makeRule(r.name, r.mode), r); });
+            try { localStorage.setItem('tac_rules_v3', JSON.stringify(S.rules)); } catch(e) {}
+            uiLog('ok', 'Loaded ' + S.rules.length + ' rule' + (S.rules.length!==1?'s':'') + ' from server for "' + saveName + '"');
+        } else if(S.rules.length > 0) {
+            // No server rules yet for this save but we have rules in memory — migrate them up
+            uiLog('sync', 'No server rules for "' + saveName + '" \u2014 uploading ' + S.rules.length + ' local rule' + (S.rules.length!==1?'s':''));
+            saveRules();
+        } else {
+            uiLog('info', 'No rules for save "' + saveName + '" (clean start)');
+        }
+        // Re-render automation tab if it's open so the list reflects the loaded rules
+        if(S.tab === 'automation') render();
+    }).catch(function() { uiLog('warn', 'Could not reach server for save rules \u2014 using local rules'); });
+}
+
+// ── Welcome modal ─────────────────────────────────────────────────────────────
+function showWelcomeModal(title, text) {
+    var overlay=document.createElement('div');
+    overlay.id='tac-welcome';
+    overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9998;display:flex;align-items:center;justify-content:center';
+    var card=document.createElement('div');
+    card.style.cssText='background:#1a1f2e;border:1px solid rgba(255,255,255,.2);border-radius:.5rem;padding:2rem;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.5)';
+    card.innerHTML='<h4 style="color:#e6edf3;margin:0 0 1rem">'+esc(title)+'</h4>'
+        +'<p style="color:#8b949e;white-space:pre-wrap;margin:0 0 1.5rem;font-size:.9rem">'+esc(text)+'</p>'
+        +'<button id="tac-welcome-ok" style="background:#0d6efd;border:none;border-radius:.375rem;color:#fff;padding:.45rem 1.5rem;font-size:.9rem;cursor:pointer">OK</button>';
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    function dismiss(){overlay.remove();}
+    document.getElementById('tac-welcome-ok').addEventListener('click',dismiss);
+    overlay.addEventListener('click',function(e){if(e.target===overlay)dismiss();});
+}
+
+// ── DOM take-over ─────────────────────────────────────────────────────────────
+function takeover() {
+    // Remove ALL known stock game UI elements.
+    // The game's index.hbs uses nav.navbar.fixed-top and main.container-fluid,
+    // NOT header.container / main.container (old wrong selectors).
+    // Also remove the stock errAlert div so it doesn't conflict with ours.
+    // We try multiple selectors in case the game template changes between versions.
+    // HIDE rather than remove stock game elements.
+    // The game's inline SPA still holds references to #tab-dashboard etc. and calls
+    // .innerHTML on them every 3 seconds. If we remove() those elements, the next
+    // getElementById() returns null and .innerHTML = ... throws a TypeError — which
+    // CEF treats as a fatal Promise error and reloads the page, kicking the user back
+    // to Dashboard. Hiding them lets SPA1 write harmlessly to invisible elements.
+    ['nav.navbar.fixed-top','main.container-fluid','header.container','main.container','#errAlert'].forEach(function(sel){
+        var el=document.querySelector(sel);if(el)el.style.display='none';
+    });
+    var TAC_BTN_STYLE='background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.2);border-radius:.3rem;color:#e6edf3;cursor:pointer;font-size:.8rem;padding:.2rem .55rem;transition:background .15s';
+    var root=document.createElement('div');root.id='tac-root';
+    root.innerHTML=['<nav id="tac-nav" style="background:#1a1f2e;border-bottom:1px solid rgba(255,255,255,.18);padding:.35rem .75rem;display:flex;align-items:center;gap:.5rem;position:sticky;top:0;z-index:1030">','  <span style="font-weight:700;color:#e6edf3;margin-right:.5rem;white-space:nowrap">\uD83E\uDDB8 HTTPAutomation</span>','  <span id="tac-savename" style="font-size:.78rem;color:#8b949e;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>','  <span id="tac-poll-light" title="Polling" style="width:9px;height:9px;border-radius:50%;background:#555;flex-shrink:0;box-shadow:0 0 0 2px rgba(0,0,0,.4)"></span>','  <span id="tac-status" style="font-size:.75rem;color:#8b949e;margin-left:auto"></span>','  <div id="tac-tabs" style="display:flex;gap:3px">','    <button type="button" data-tab="dashboard"  style="'+TAC_BTN_STYLE+'">Dashboard</button>','    <button type="button" data-tab="levers"     style="'+TAC_BTN_STYLE+'">Levers</button>','    <button type="button" data-tab="adapters"   style="'+TAC_BTN_STYLE+'">Adapters</button>','    <button type="button" data-tab="sensors"    style="'+TAC_BTN_STYLE+'">Sensors</button>','    <button type="button" data-tab="population" style="'+TAC_BTN_STYLE+'">Population</button>','    <button type="button" data-tab="automation" style="'+TAC_BTN_STYLE+'">Automation</button>','    <button type="button" data-tab="logs"       style="'+TAC_BTN_STYLE+'">Logs</button>','  </div>','</nav>','<div id="tac-content" style="min-height:calc(100vh - 46px)"></div>','<div id="tac-err" class="alert alert-danger position-fixed bottom-0 start-50 translate-middle-x d-none mb-3 shadow" style="z-index:9999;text-align:center;min-width:220px"></div>'].join('');
+    document.body.appendChild(root);
+    var style=document.createElement('style');
+    style.textContent=['body,html{background-color:#0d1117!important;padding:0!important;margin:0!important}','#tac-root{background:#0d1117;min-height:100vh}','#tac-nav button[data-tab]:hover{background:rgba(255,255,255,.15)!important}','#tac-nav button[data-tab].active{background:rgba(79,140,255,.35)!important;border-color:rgba(79,140,255,.7)!important}','.tac-on{color:#00d000;font-weight:600}','.tac-off{color:#6c757d}','.tac-spr{color:#dbd51a;font-weight:600}','.card-sm .card-body{padding:.5rem .75rem}','#tac-tabs .btn.active{background:rgba(255,255,255,.15)!important}','body{background-color:#212529}','.tac-rule-row:hover{background:rgba(255,255,255,.04)}','.tac-mode-simple{background:#6c757d!important}','.tac-mode-fbd{background:#0dcaf0!important;color:#000!important}','.tac-mode-code{background:#ffc107!important;color:#000!important}','.tac-cond-row{background:rgba(255,255,255,.05);border-radius:.375rem}','.tac-cond-row select,.tac-cond-row input{max-width:none}','.tac-code-area{font-family:Consolas,Menlo,"Courier New",monospace;font-size:.82rem;background:#0d1117;color:#e6edf3;border:1px solid rgba(255,255,255,.15);resize:vertical;min-height:220px;width:100%;border-radius:.375rem;padding:.6rem .8rem;line-height:1.5;outline:none}','.tac-code-area:focus{border-color:#0d6efd;box-shadow:0 0 0 .2rem rgba(13,110,253,.25)}','.tac-log-panel{font-family:Consolas,Menlo,"Courier New",monospace;font-size:.78rem;background:#0d1117;border:1px solid rgba(255,255,255,.1);border-radius:.375rem;padding:.5rem .75rem;max-height:180px;overflow-y:auto;min-height:60px}','.tac-log-line{padding:1px 0;border-bottom:1px solid rgba(255,255,255,.04);white-space:pre-wrap;word-break:break-all}','.tac-log-line:last-child{border-bottom:none}','.tac-log-err{color:#f85149}','.tac-log-time{color:#6e7681;margin-right:.5em;user-select:none}','.tac-import-box{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.15);border-radius:.375rem;padding:.75rem;margin-bottom:.75rem}'].join('\n');
+    document.head.appendChild(style);
+    document.getElementById('tac-tabs').addEventListener('click',function(e){var btn=e.target.closest('button[data-tab]');if(!btn)return;switchTab(btn.dataset.tab);});
+    uiLog('ok', 'HTTPAutomation started \u2014 '
+        + S.rules.length + ' rule' + (S.rules.length!==1?'s':'') + ' from localStorage'
+        + (S.levers.length   ? ', ' + S.levers.length   + ' levers'   : '')
+        + (S.adapters.length ? ', ' + S.adapters.length + ' adapters' : ''));
+    // Check for welcome.json popup before showing the dashboard
+    get('/api/welcome').then(function(w){
+        if(w&&w.title){
+            showWelcomeModal(w.title, w.text||'');
+        }
+    }).catch(function(){/* 404 = no file, silent */});
+    switchTab('dashboard');poll();setInterval(poll,500);
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(name) {
+    if(S.tab==='automation'&&name!=='automation'){fbdDetach();S.automationView='list';S.editingRuleId=null;S.showImport=false;}
+    S.tab=name;
+    document.querySelectorAll('#tac-tabs button').forEach(function(b){b.classList.toggle('active',b.dataset.tab===name);});
+    if(name==='population'&&!S.beaversLoaded)fetchBeavers();
+    render();
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+function get(path){return fetch(path,{cache:'no-store'}).then(function(r){if(r.status===404)return Promise.reject({status:404,notFound:true});if(!r.ok)return Promise.reject({status:r.status});return r.json()});}
+function post(url){return fetch(url,{method:'POST',cache:'no-store'});}
+function showErr(msg){var el=document.getElementById('tac-err');if(!el)return;el.textContent=msg;el.classList.remove('d-none');clearTimeout(showErr._t);showErr._t=setTimeout(function(){el.classList.add('d-none');},4000);}
+function showOk(msg){var el=document.getElementById('tac-err');if(!el)return;el.textContent=msg;el.className='alert alert-success position-fixed bottom-0 start-50 translate-middle-x mb-3 shadow';el.style.zIndex='9999';el.style.minWidth='220px';el.style.textAlign='center';clearTimeout(showErr._t);showErr._t=setTimeout(function(){el.classList.add('d-none');el.className='alert alert-danger position-fixed bottom-0 start-50 translate-middle-x d-none mb-3 shadow';},2500);}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// ── Poll ──────────────────────────────────────────────────────────────────────
+function poll() {
+    if(S.polling)return;S.polling=true;
+    var leversP=get('/api/levers').catch(function(){return null;});
+    var adaptersP=get('/api/adapters').catch(function(){return null;});
+    var sensorsP=DLL_AVAILABLE===false?Promise.resolve(null):get('/api/sensors').catch(function(){return null;});
+    var gsP=DLL_AVAILABLE===false?Promise.resolve(null):get('/api/gamestate').catch(function(e){if(e&&e.notFound)DLL_AVAILABLE=false;return null;});
+    var popP=DLL_AVAILABLE===false?Promise.resolve(null):get('/api/population').catch(function(){return null;});
+    var beaversP=(S.tab==='population'&&DLL_AVAILABLE!==false)?get('/api/beavers').catch(function(){return null;}):Promise.resolve(null);
+    Promise.all([leversP,adaptersP,gsP,popP,beaversP,sensorsP]).then(function(res){
+        try {
+        // Merge poll data into S.levers rather than replacing entirely, so URL fields
+        // seeded from window.TB.levers at boot are preserved for levers the backend
+        // doesn't re-include. Also picks up colorUrl (new in v5.0.0 API).
+        if(res[0]){
+            res[0].forEach(function(fresh){
+                var ex=S.levers.find(function(l){return l.name===fresh.name;});
+                if(ex){
+                    ex.state=fresh.state;
+                    ex.isSpringReturn=fresh.springReturn||fresh.isSpringReturn||false;
+                    if(fresh.colorUrl) ex.colorUrl=fresh.colorUrl;
+                    if(fresh.switchOnUrl)  ex.switchOnUrl=fresh.switchOnUrl;
+                    if(fresh.switchOffUrl) ex.switchOffUrl=fresh.switchOffUrl;
+                } else {
+                    // New lever added mid-session — add it with whatever the API gave us
+                    S.levers.push({
+                        name:fresh.name, state:fresh.state,
+                        isSpringReturn:fresh.springReturn||fresh.isSpringReturn||false,
+                        switchOnUrl:fresh.switchOnUrl||'', switchOffUrl:fresh.switchOffUrl||'',
+                        colorUrl:fresh.colorUrl||''
+                    });
+                }
+            });
+        }
+        if(res[1])S.adapters=res[1];
+
+        // Track DLL state transitions for logging (declare before the if so scope is clean)
+        var prevDll = DLL_AVAILABLE;
+        if(res[2]){
+            S.gameState=res[2]; DLL_AVAILABLE=true;
+            var newSave=res[2].saveName||'';
+            if(newSave && newSave!==S.currentSaveName) loadRulesFromServer(newSave);
+            if(prevDll===false) uiLog('ok','DLL came online \u2014 game state and population now available');
+        } else if(prevDll===true || prevDll===null) {
+            // Transitioned to offline (or first poll with no gamestate)
+            if(prevDll===true) uiLog('warn','DLL went offline \u2014 /api/gamestate returned 404');
+        }
+
+        if(res[3])S.population=res[3];
+        if(res[4]){S.beavers=res[4];S.beaversLoaded=true;}
+        if(res[5]&&Array.isArray(res[5].sensors))S.sensors=res[5].sensors;
+        else if(res[5]&&Array.isArray(res[5]))S.sensors=res[5];
+
+        runAutomation();
+
+        // Update clock + poll status light
+        var st=document.getElementById('tac-status');
+        if(st){var now=new Date();st.textContent=now.getHours().toString().padStart(2,'0')+':'+now.getMinutes().toString().padStart(2,'0')+':'+now.getSeconds().toString().padStart(2,'0');}
+        var dot=document.getElementById('tac-poll-light');
+        if(dot){var gotData=res[0]||res[1];if(gotData){dot.style.background='#00cc44';dot.style.boxShadow='0 0 6px #00cc44,0 0 0 2px rgba(0,0,0,.4)';}else{dot.style.background='#f85149';dot.style.boxShadow='0 0 6px #f85149,0 0 0 2px rgba(0,0,0,.4)';}}
+
+        // ── Selective re-render after poll ────────────────────────────────────
+        // Only re-render tabs that show live game data.
+        // - automation tab: list is stable between user actions; edit mode has dedicated updaters.
+        //   loadRulesFromServer() calls render() itself when on automation tab.
+        // - logs tab: self-patches via #tac-log-panel id; a full render would destroy scroll position.
+        // Rebuilding DOM every 3 s was destroying any interaction (clicks, open panels, focus).
+        if(S.tab==='automation'){
+            if(S.automationView==='edit'){
+                var er=S.rules.find(function(r){return r.id===S.editingRuleId;});
+                if(er&&er.mode==='code') updateCodeLogPanel();
+                else if(er&&er.mode==='fbd') fbdDrawCanvas();
+                // simple editor: no live update needed while user is editing
+            }
+            // list view: don't re-render from poll — rules only change on user action or save load
+        } else if(S.tab==='logs'){
+            // uiLog() patches #tac-log-panel directly; no full render needed
+        } else {
+            // dashboard, levers, adapters, sensors, population — live data worth refreshing
+            render();
+        }
+        } catch(pollErr) {
+            uiLog('err', 'Poll render error: ' + (pollErr&&(pollErr.message||String(pollErr))));
+        }
+    }).finally(function(){S.polling=false;});
+}
+function fetchBeavers(){if(DLL_AVAILABLE===false)return;get('/api/beavers').then(function(b){S.beavers=b||[];S.beaversLoaded=true;if(S.tab==='population')render();}).catch(function(){});}
+
+// ── Automation engine ─────────────────────────────────────────────────────────
+function evalCondition(cond) {
+    if(cond.type==='adapter'){var a=S.adapters.find(function(x){return x.name===cond.adapterName;});if(!a)return false;return(cond.adapterState==='on'&&a.state===true)||(cond.adapterState==='off'&&a.state===false);}
+    if(cond.type==='lever'){var lv=S.levers.find(function(x){return x.name===cond.leverName;});if(!lv)return false;return(cond.leverState==='on'&&lv.state===true)||(cond.leverState==='off'&&lv.state===false);}
+    if(cond.type==='sensor'){var sn=S.sensors.find(function(x){return x.name===cond.sensorName;});if(!sn)return false;return(cond.sensorState==='on'&&sn.isOn===true)||(cond.sensorState==='off'&&sn.isOn===false);}
+    if(cond.type==='gamestate'){
+        if(!S.gameState)return false;
+        var gs=S.gameState;
+        // weatherId is the reliable source (new backend); isDrought/isBadtide are fallbacks
+        var wId=(gs.weatherId||'').toLowerCase();
+        if(cond.field==='isDrought')  return wId==='drought'||!!gs.isDrought;
+        if(cond.field==='isBadtide')  return wId==='badtide'||!!gs.isBadtide;
+        if(cond.field==='isHazardous')return !!gs.weatherIsHazardous||!!gs.isHazardous||(wId!==''&&wId!=='temperate'&&!!gs.weatherIsHazardous!==false);
+        return !!gs[cond.field];
+    }
+    if(cond.type==='time'){if(!S.gameState)return false;var h=S.gameState.timeOfDayHours,fr=cond.fromHour,to=cond.toHour;return fr<=to?(h>=fr&&h<to):(h>=fr||h<to);}
+    if(cond.type==='population'){if(!S.population)return false;var val=S.population[cond.field];if(val===undefined)return false;var t=cond.threshold;switch(cond.op){case'gt':return val>t;case'gte':return val>=t;case'lt':return val<t;case'lte':return val<=t;case'eq':return val===t;}}
+    if(cond.type==='duration'){var da=S.adapters.find(function(x){return x.name===cond.adapterName;});var dOn=da&&da.state===true;if(!dOn){cond._startTime=null;return false;}if(!cond._startTime)cond._startTime=Date.now();return(Date.now()-cond._startTime)>=(cond.durationSec||10)*1000;}
+    if(cond.type==='popchange'){if(!S.population)return false;var pcv=S.population[cond.field];if(pcv===undefined)return false;var pcPrev=cond._prevValue;cond._prevValue=pcv;if(pcPrev===undefined)return false;return cond.direction==='growing'?(pcv>pcPrev):(pcv<pcPrev);}
+    if(cond.type==='daycycle'){if(!S.gameState)return false;var dday=S.gameState.dayNumber;if(dday===undefined)return false;var dt=cond.threshold||1;switch(cond.op){case'gt':return dday>dt;case'gte':return dday>=dt;case'lt':return dday<dt;case'lte':return dday<=dt;case'eq':return dday===dt;}}
+    if(cond.type==='sensor_value'){var svn=S.sensors.find(function(x){return x.name===cond.sensorName;});if(!svn)return false;if(svn.value===null||svn.value===undefined)return svn.isOn===true;var sv=parseFloat(svn.value),svt=parseFloat(cond.threshold)||0;switch(cond.op){case'gt':return sv>svt;case'gte':return sv>=svt;case'lt':return sv<svt;case'lte':return sv<=svt;case'eq':return Math.abs(sv-svt)<0.0001;}return false;}
+    return false;
+}
+// Deduplication: prevents same lever/state being POSTed repeatedly within DEDUP_MS.
+// This stops "direct" mode from fighting manual lever toggles — the guard
+// lever.state===wantOn works for one cycle but the poll merge can reset lever.state
+// before the HTTP response arrives, defeating it on the next cycle.
+var _leverLastAction = {};
+var DEDUP_MS = 4000;
+
+function applyActions(actions, _ruleName){(actions||[]).forEach(function(action){
+    var lever=S.levers.find(function(l){return l.name===action.leverName;});if(!lever)return;
+    if(action.leverState==='color'){
+        var hex=(action.leverColor||'ffffff').replace(/^#/,'').slice(0,6).toLowerCase();
+        if(lever.colorUrl){
+            post(lever.colorUrl.replace('{color}',hex))
+                .then(function(r){if(r.ok)uiLog('rule','Lever "'+action.leverName+'" \u2192 color #'+hex+(_ruleName?' ['+_ruleName+']':''));else uiLog('err','Color HTTP '+r.status+' ['+action.leverName+']');})
+                .catch(function(e){uiLog('err','Color error: '+(e.message||e));});
+        }
+        return;
+    }
+    var wantOn=action.leverState==='on';
+    if(lever.state===wantOn)return;
+    var dedupKey=action.leverName+'_'+(wantOn?'on':'off');
+    if(Date.now()-(_leverLastAction[dedupKey]||0)<DEDUP_MS)return;
+    _leverLastAction[dedupKey]=Date.now();
+    post(wantOn?lever.switchOnUrl:lever.switchOffUrl).then(function(r){if(r.ok){lever.state=wantOn;uiLog('rule','Lever "'+action.leverName+'" \u2192 '+action.leverState.toUpperCase()+(_ruleName?' ['+_ruleName+']':''));}else{uiLog('err','Lever "'+action.leverName+'" toggle HTTP '+r.status+(_ruleName?' ['+_ruleName+']':''));showErr('Rule "'+action.leverName+'": HTTP '+r.status);}}).catch(function(e){uiLog('err','Lever "'+action.leverName+'" error: '+(e.message||e));showErr('Rule "'+action.leverName+'": '+e.message);});
+});}
+function runAutomation() {
+    var now=Date.now();
+    S.rules.filter(function(r){return r.enabled;}).forEach(function(rule){
+        if(rule.mode==='simple'){
+            var sim=rule.simple;if(!sim||!sim.conditions||!sim.conditions.length)return;
+            var triggered=sim.conditionMode==='or'?sim.conditions.some(evalCondition):sim.conditions.every(evalCondition);
+            // Auto-reset latch: evaluate reset conditions if defined
+            if(sim.resetConditions&&sim.resetConditions.length){
+                var resetTriggered=sim.resetCondMode==='or'?sim.resetConditions.some(evalCondition):sim.resetConditions.every(evalCondition);
+                if(resetTriggered&&sim._latchFired){sim._latchFired=false;uiLog('rule','['+rule.name+'] Latch auto-reset');}
+            }
+            var ft=sim.functionType||'direct';
+            // "trigger" = rising-edge only (fires once when condition becomes true)
+            // "direct"  = enforce every cycle while true (legacy behaviour)
+            if(ft==='trigger'){
+                if(triggered&&!sim._prevTriggered){
+                    uiLog('rule','['+rule.name+'] Trigger \u2014 rising edge');
+                    applyActions(sim.actions,rule.name);
+                }
+                sim._prevTriggered=triggered;
+                return;
+            }
+            if(ft==='direct'){
+                if(triggered) applyActions(sim.actions, rule.name);
+                sim._prevTriggered=triggered;
+                return;
+            }
+            if(ft==='timer'){
+                if(!triggered){sim._timerStart=null;sim._prevTriggered=false;return;}
+                if(!sim._timerStart)sim._timerStart=now;
+                if((now-sim._timerStart)/1000>=(sim.timerSeconds||0)){
+                    uiLog('rule','['+rule.name+'] Timer elapsed ('+sim.timerSeconds+'s) \u2014 firing');
+                    applyActions(sim.actions,rule.name);sim._timerStart=null;
+                }
+                return;
+            }
+            if(ft==='latch'){
+                if(triggered&&!sim._latchFired){
+                    sim._latchFired=true;
+                    uiLog('rule','['+rule.name+'] Latch set \u2014 firing');
+                    applyActions(sim.actions,rule.name);
+                }
+                if(!triggered)sim._latchFired=false;
+            }
+            return;
+        }
+        if(rule.mode==='code'){
+            var _prevCodeErr=rule._lastError;
+            runCodeRule(rule);
+            if(rule._lastError&&rule._lastError!==_prevCodeErr)
+                uiLog('err','[Code:"'+rule.name+'"] '+rule._lastError);
+            return;
+        }
+        if(rule.mode==='fbd'){
+            var _prevFbdErr=rule._lastError;
+            runFbdRule(rule);
+            if(rule._lastError&&rule._lastError!==_prevFbdErr)
+                uiLog('err','[FBD:"'+rule.name+'"] '+rule._lastError);
+            return;
+        }
+    });
+}
+
+// ── Code rule execution ───────────────────────────────────────────────────────
+var CODE_LOG_MAX=80;
+function codeLog(ruleId,msg,isErr){if(!S.codeLogs[ruleId])S.codeLogs[ruleId]=[];var now=new Date(),ts=now.getHours().toString().padStart(2,'0')+':'+now.getMinutes().toString().padStart(2,'0')+':'+now.getSeconds().toString().padStart(2,'0');S.codeLogs[ruleId].push({time:ts,msg:String(msg),isErr:!!isErr});if(S.codeLogs[ruleId].length>CODE_LOG_MAX)S.codeLogs[ruleId].shift();}
+function runCodeRule(rule) {
+    var script=rule.code&&rule.code.script;if(!script||!script.trim())return;
+    var ctx={adapters:S.adapters.slice(),levers:S.levers.slice(),sensors:S.sensors.slice(),gameState:S.gameState||null,population:S.population||null};
+    function setLever(name,state){applyActions([{leverName:name,leverState:(state===true||state==='on')?'on':'off'}]);}
+    function log(msg){codeLog(rule.id,msg,false);}
+    try{/*jshint evil:true*/var fn=new Function('adapters','levers','sensors','gameState','population','setLever','log',script);fn(ctx.adapters,ctx.levers,ctx.sensors,ctx.gameState,ctx.population,setLever,log);rule._lastError=null;}
+    catch(e){codeLog(rule.id,e.message||String(e),true);rule._lastError=e.message||String(e);}
+}
+function updateCodeLogPanel(){var rule=S.editingRuleId&&S.rules.find(function(r){return r.id===S.editingRuleId;});if(!rule||rule.mode!=='code')return;var el=document.getElementById('tac-code-log');if(!el)return;el.innerHTML=renderCodeLogLines(rule.id);el.scrollTop=el.scrollHeight;}
+function renderCodeLogLines(ruleId){var lines=S.codeLogs[ruleId]||[];if(!lines.length)return'<span class="text-muted" style="font-size:.78rem;font-family:monospace">No output yet \u2014 run the rule or call log() in your script.</span>';return lines.map(function(l){return'<div class="tac-log-line'+(l.isErr?' tac-log-err':'')+'"><span class="tac-log-time">'+esc(l.time)+'</span>'+(l.isErr?'\u274c ':'')+esc(l.msg)+'</div>';}).join('');}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+    var el=document.getElementById('tac-content');if(!el)return;
+    var dllWarn=DLL_AVAILABLE===false?'<div class="alert alert-warning d-flex align-items-center gap-2 mx-3 mt-3 mb-0 py-2"><span class="fs-5">\u26a0\ufe0f</span><span><strong>DLL not loaded</strong> \u2014 Game state, population, and beaver data unavailable. Levers, adapters, and automation work normally.</span></div>':'';
+    switch(S.tab){
+        case'dashboard': el.innerHTML=dllWarn+renderDashboard(); break;
+        case'levers':    el.innerHTML=renderLevers();            break;
+        case'adapters':  el.innerHTML=renderAdapters();          break;
+        case'sensors':   el.innerHTML=dllWarn+renderSensors();   break;
+        case'population':el.innerHTML=dllWarn+renderPopulation();break;
+        case'automation':
+            el.innerHTML=renderAutomation();
+            if(S.automationView==='edit'){var er=S.rules.find(function(r){return r.id===S.editingRuleId;});if(er&&er.mode==='fbd')attachFbdCanvas(er);}
+            break;
+        case'logs':      el.innerHTML=renderLogs();               break;
+    }
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+function renderDashboard() {
+    var gs=S.gameState,pop=S.population;
+    function statCard(label,val,color){return'<div class="col-auto"><div class="card bg-'+color+' bg-opacity-25 text-center px-3 py-2" style="min-width:72px"><div class="fs-5 fw-bold">'+esc(String(val))+'</div><div class="small text-muted">'+esc(label)+'</div></div></div>';}
+    var gsHtml;
+    if(!gs){gsHtml='<div class="card bg-body-secondary h-100"><div class="card-body text-center text-muted py-4"><div class="fs-2 mb-2">\uD83C\uDF0D</div><div>Load a save to see game state</div>'+(DLL_AVAILABLE===false?'<div class="small mt-1 text-warning">Requires DLL mod</div>':'')+'</div></div>';}
+    else{
+        // weatherId is the backend's best guess; isDrought/isBadtide are fallbacks.
+        // When the backend can't identify the specific hazard (CurrentCycleHazardousWeather
+        // returns null), weatherId stays "Temperate" while isHazardous/weatherIsHazardous=true.
+        // In that case, label it "Hazardous" rather than showing "⚠ Temperate".
+        var wId=(gs.weatherId||'').toLowerCase();
+        var isDrought=wId==='drought'||!!gs.isDrought;
+        var isBadtide=wId==='badtide'||!!gs.isBadtide;
+        var isHazardous=!!gs.weatherIsHazardous||!!gs.isHazardous;
+        // weatherId is unreliable when it says "Temperate" but isHazardous=true
+        var unknownHazard=isHazardous&&!isDrought&&!isBadtide;
+        // Build a clean display label
+        var weatherLabel=isDrought?'Drought':isBadtide?'Badtide':unknownHazard?'Hazardous':(gs.weatherId&&gs.weatherId!=='Temperate'?esc(gs.weatherId):'Temperate');
+        var daysLeft=gs.weatherDaysRemaining>0?' <span class="text-muted" style="font-size:.75em">('+gs.weatherDaysRemaining+'d left)</span>':'';
+        var wBadge=isDrought
+            ?'<span class="badge bg-warning text-dark">\uD83C\uDF35 Drought</span>'
+            :isBadtide
+            ?'<span class="badge bg-danger">\u2620\ufe0f Badtide</span>'
+            :unknownHazard
+            ?'<span class="badge bg-warning text-dark">\u26a0\ufe0f Hazardous</span>'
+            :'<span class="badge bg-success">\u2600\ufe0f Temperate</span>';
+        gsHtml='<div class="card bg-body-secondary h-100"><div class="card-body"><h6 class="card-title text-muted mb-2">\uD83C\uDF0D Game State</h6><table class="table table-sm table-borderless mb-0 small"><tbody><tr><td class="text-muted pe-3">Cycle</td><td>'+gs.cycleNumber+'</td></tr><tr><td class="text-muted pe-3">Day</td><td>'+gs.dayNumber+'</td></tr><tr><td class="text-muted pe-3">Time</td><td>'+gs.timeOfDayHours+'h &mdash; '+esc(gs.dayStage)+'</td></tr><tr><td class="text-muted pe-3">Weather</td><td>'+wBadge+daysLeft+'</td></tr></tbody></table></div></div>';
+    }
+    var popHtml;
+    if(!pop){popHtml='<div class="card bg-body-secondary h-100"><div class="card-body text-center text-muted py-4"><div class="fs-2 mb-2">\uD83E\uDDB8</div><div>Load a save to see population</div></div></div>';}
+    else{popHtml='<div class="card bg-body-secondary h-100"><div class="card-body"><h6 class="card-title text-muted mb-2">\uD83E\uDDB8 Population</h6><div class="row g-2 row-cols-auto">'+statCard('Total',pop.totalBeavers,'primary')+statCard('Adults',pop.adults,'success')+statCard('Children',pop.children,'info')+statCard('Idle',pop.unemployed,pop.unemployed>0?'warning':'secondary')+statCard('Homeless',pop.homeless,pop.homeless>0?'warning':'secondary')+statCard('Injured',pop.injured,pop.injured>0?'danger':'secondary')+statCard('Contam.',pop.contaminated,pop.contaminated>0?'danger':'secondary')+'</div></div></div>';}
+    var lvOn=S.levers.filter(function(l){return l.state;}).length;
+    var adOn=S.adapters.filter(function(a){return a.state;}).length;
+    var rOn=S.rules.filter(function(r){return r.enabled;}).length;
+    // Per-mode active counts
+    var rSimple=S.rules.filter(function(r){return r.enabled&&r.mode==='simple';}).length;
+    var rFbd   =S.rules.filter(function(r){return r.enabled&&r.mode==='fbd';}).length;
+    var rCode  =S.rules.filter(function(r){return r.enabled&&r.mode==='code';}).length;
+    var modeChips='';
+    if(rSimple)modeChips+='<span class="badge tac-mode-simple">S:'+rSimple+'</span>';
+    if(rFbd)   modeChips+='<span class="badge tac-mode-fbd">F:'+rFbd+'</span>';
+    if(rCode)  modeChips+='<span class="badge tac-mode-code">C:'+rCode+'</span>';
+    function miniCard(icon,title,chips){return'<div class="card bg-body-secondary"><div class="card-body py-2 px-3"><div class="d-flex align-items-center gap-2"><span class="fs-5">'+icon+'</span><span class="fw-semibold small">'+esc(title)+'</span><div class="ms-auto d-flex gap-1 flex-wrap">'+chips+'</div></div></div></div>';}
+    var _sensors=Array.isArray(S.sensors)?S.sensors:[];
+    var snOn=_sensors.filter(function(s){return s.isOn;}).length;
+    var summaryHtml='<div class="d-flex flex-column gap-2">'+miniCard('\uD83C\uDF9A','Levers ('+S.levers.length+')','<span class="badge bg-success">'+lvOn+' ON</span><span class="badge bg-secondary">'+(S.levers.length-lvOn)+' OFF</span>')+miniCard('\uD83D\uDCE1','Adapters ('+S.adapters.length+')','<span class="badge bg-success">'+adOn+' ON</span><span class="badge bg-secondary">'+(S.adapters.length-adOn)+' OFF</span>')+(_sensors.length?miniCard('\uD83D\uDCF1','Sensors ('+_sensors.length+')','<span class="badge bg-success">'+snOn+' ON</span><span class="badge bg-secondary">'+(_sensors.length-snOn)+' OFF</span>'):'')+ miniCard('\u26a1','Automation','<span class="badge bg-primary">'+rOn+' active</span>'+modeChips+'<span class="badge bg-secondary">'+S.rules.length+' total</span>')+'</div>';
+    return'<div class="container-fluid py-3"><div class="row g-3"><div class="col-lg-4">'+gsHtml+'</div><div class="col-lg-4">'+popHtml+'</div><div class="col-lg-4">'+summaryHtml+'</div></div></div>';
+}
+
+// ── Levers ────────────────────────────────────────────────────────────────────
+function renderLevers(){
+    if(!S.levers.length)return'<div class="text-center text-muted py-5 fs-5">No HTTP Levers found.<br><small class="fs-6">Place HTTP Lever buildings in your settlement.</small></div>';
+    var rows=S.levers.map(function(l){
+        var ln=esc(l.name);
+        var safeId='lc_'+l.name.replace(/[^a-zA-Z0-9]/g,'_');
+        var stateHtml=l.isSpringReturn?'<span class="tac-spr">SPR</span>':l.state?'<span class="tac-on">ON</span>':'<span class="tac-off">OFF</span>';
+        // Color picker — native wheel + hex text input side by side
+        var colorPicker=l.colorUrl
+            ? '<span class="d-inline-flex align-items-center gap-1 ms-2">'
+            + '<input type="color" id="'+safeId+'" value="#ff0000"'
+            + ' style="width:28px;height:28px;padding:1px;border:1px solid rgba(255,255,255,.25);border-radius:.25rem;background:transparent;cursor:pointer"'
+            + ' oninput="document.getElementById(\''+safeId+'_hex\').value=this.value.slice(1)">'
+            + '<input type="text" id="'+safeId+'_hex" value="ff0000" maxlength="6"'
+            + ' style="width:62px;font-size:.75rem;font-family:monospace;background:#1a1f2e;border:1px solid rgba(255,255,255,.2);border-radius:.25rem;color:#e6edf3;padding:.1rem .3rem"'
+            + ' oninput="if(this.value.length===6)document.getElementById(\''+safeId+'\').value=\'#\'+this.value">'
+            + '<button type="button" style="font-size:.75rem;padding:.15rem .45rem;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);border-radius:.25rem;color:#e6edf3;cursor:pointer"'
+            + ' onclick="TAC.color(\''+ln+'\',document.getElementById(\''+safeId+'_hex\').value)">Apply</button>'
+            + '</span>'
+            : '';
+        return'<tr><td class="align-middle fw-semibold">'+ln+'</td>'
+            +'<td class="text-center align-middle">'+stateHtml+'</td>'
+            +'<td class="align-middle">'
+            +'<button type="button" class="btn btn-sm btn-success me-1" onclick="TAC.on(\''+ln+'\')">On</button>'
+            +'<button type="button" class="btn btn-sm btn-secondary me-1" onclick="TAC.off(\''+ln+'\')">Off</button>'
+            +colorPicker
+            +'</td></tr>';
+    }).join('');
+    return'<div class="container-fluid py-3"><div class="d-flex justify-content-center"><table class="table table-hover table-sm w-auto"><thead><tr><th>Lever</th><th class="text-center">State</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
+// ── Adapters ──────────────────────────────────────────────────────────────────
+function renderAdapters(){if(!S.adapters.length)return'<div class="text-center text-muted py-5 fs-5">No HTTP Adapters found.<br><small class="fs-6">Place HTTP Adapter buildings in your settlement.</small></div>';var rows=S.adapters.map(function(a){return'<tr><td class="align-middle fw-semibold">'+esc(a.name)+'</td><td class="text-center align-middle">'+(a.state?'<span class="tac-on">ON</span>':'<span class="tac-off">OFF</span>')+'</td></tr>';}).join('');return'<div class="container-fluid py-3"><div class="d-flex justify-content-center"><table class="table table-hover table-sm w-auto"><thead><tr><th>Adapter</th><th class="text-center">State</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';}
+
+// ── Sensors ────────────────────────────────────────────────────────────────────
+// Format fractional hours (e.g. 5.625) as 24h HH:MM string ("05:37")
+function fmtTime(v){var h=Math.floor(v),m=Math.floor((v-h)*60);return('0'+h).slice(-2)+':'+('0'+m).slice(-2);}
+// Sensor type → display icon mapping
+var SENSOR_ICONS={FlowSensor:'\uD83C\uDF0A',DepthSensor:'\uD83D\uDCCF',ContaminationSensor:'\u2620\ufe0f',Chronometer:'\u23F0',WeatherStation:'\uD83C\uDF27\ufe0f',PowerMeter:'\u26A1',PopulationCounter:'\uD83E\uDDB8',ResourceCounter:'\uD83D\uDCE6',ScienceCounter:'\uD83D\uDD2C',Memory:'\uD83D\uDCBE',Relay:'\uD83D\uDD17',Unknown:'\u2753'};
+function renderSensors(){
+    var slist=Array.isArray(S.sensors)?S.sensors:[];
+    if(!slist.length)return'<div class="text-center text-muted py-5 fs-5">\uD83D\uDCF1 No sensors found.<br><small class="fs-6">Place automation sensor buildings (Flow Sensor, Depth Sensor, etc.) in your settlement.</small></div>';
+    var rows=slist.map(function(s){
+        var icon=SENSOR_ICONS[s.type]||SENSOR_ICONS.Unknown;
+        var typeLabel=(s.type||'Unknown').replace(/([A-Z])/g,' $1').trim();
+        var opSym={'gt':'>','gte':'\u2265','lt':'<','lte':'\u2264','eq':'='};
+        var valStr=s.value!==null&&s.value!==undefined
+            ?('<span class="fw-semibold">'+(s.unit==='HH:MM'?fmtTime(s.value):Number(s.value).toFixed(2))+'</span>'+(s.unit&&s.unit!=='HH:MM'?'<span class="text-muted ms-1" style="font-size:.8em">'+esc(s.unit)+'</span>':''))
+            :'<span class="text-muted small">\u2014</span>';
+        var threshStr=(s.threshold!==null&&s.threshold!==undefined&&s.operator)
+            ?('<span class="text-muted small">'+(opSym[s.operator]||s.operator)+' '+Number(s.threshold).toFixed(2)+' '+esc(s.unit||'')+'</span>')
+            :'<span class="text-muted small">\u2014</span>';
+        var badge=s.isOn?'<span class="tac-on">ON</span>':'<span class="tac-off">OFF</span>';
+        return'<tr>'
+            +'<td class="align-middle" style="font-size:1.1em">'+icon+'</td>'
+            +'<td class="align-middle fw-semibold">'+esc(s.name)+'</td>'
+            +'<td class="align-middle text-muted small">'+esc(typeLabel)+'</td>'
+            +'<td class="align-middle text-center">'+valStr+'</td>'
+            +'<td class="align-middle text-center">'+threshStr+'</td>'
+            +'<td class="align-middle text-center">'+badge+'</td>'
+            +'</tr>';
+    }).join('');
+    return'<div class="container-fluid py-3">'
+        +'<table class="table table-hover table-sm"><thead><tr><th></th><th>Name</th><th>Type</th><th class="text-center">Value</th><th class="text-center">Fires when</th><th class="text-center">Signal</th></tr></thead>'
+        +'<tbody>'+rows+'</tbody></table>'
+        +'<div class="text-muted small mt-2">\u2139\ufe0f Signal is ON when the in-game threshold condition is met. Use <strong>Sensor value</strong> condition type in rules to compare the numeric reading directly.</div>'
+        +'</div>';
+}
+
+// ── Population
+// ── Population ────────────────────────────────────────────────────────────────
+function renderPopulation(){var pop=S.population;if(!pop)return'<div class="text-center text-muted py-5">Population data unavailable.<br><small>Requires the HTTPAutomation DLL mod to be loaded.</small></div>';function statCard(label,val,color){return'<div class="col-auto"><div class="card bg-'+color+' bg-opacity-25 text-center px-3 py-2" style="min-width:72px"><div class="fs-5 fw-bold">'+esc(String(val))+'</div><div class="small text-muted">'+esc(label)+'</div></div></div>';}var summary='<div class="row g-2 row-cols-auto justify-content-center mb-4">'+statCard('Total',pop.totalBeavers,'primary')+statCard('Adults',pop.adults,'success')+statCard('Children',pop.children,'info')+statCard('Idle',pop.unemployed,pop.unemployed>0?'warning':'secondary')+statCard('Homeless',pop.homeless,pop.homeless>0?'warning':'secondary')+statCard('Injured',pop.injured,pop.injured>0?'danger':'secondary')+statCard('Contam.',pop.contaminated,pop.contaminated>0?'danger':'secondary')+'</div>';var beaverHtml;if(!S.beaversLoaded){beaverHtml='<div class="text-center text-muted py-3"><span class="spinner-border spinner-border-sm me-2"></span>Loading beavers...</div>';}else if(!S.beavers.length){beaverHtml='<div class="text-center text-muted py-3">No beavers found.</div>';}else{var cards=S.beavers.map(function(b){var badges='';if(!b.isAdult)badges+='<span class="badge bg-info me-1">Child</span>';if(!b.hasJob)badges+='<span class="badge bg-warning text-dark me-1">Idle</span>';if(!b.hasHome)badges+='<span class="badge bg-warning text-dark me-1">Homeless</span>';if(b.isInjured)badges+='<span class="badge bg-danger me-1">Injured</span>';if(b.isContaminated)badges+='<span class="badge bg-danger me-1">Contam.</span>';function bar(val,icon){var pct=Math.round(Math.max(0,Math.min(1,(val+1)/2))*100);var c=pct>60?'success':pct>30?'warning':'danger';return'<div class="d-flex align-items-center gap-1 mb-1"><span style="width:1.1em;font-size:.8em">'+icon+'</span><div class="progress flex-grow-1" style="height:5px"><div class="progress-bar bg-'+c+'" style="width:'+pct+'%"></div></div><span class="text-muted" style="font-size:.65em;width:3.2em">'+val.toFixed(2)+'</span></div>';}var sub=(b.isAdult?'Adult':'Child')+' \u00b7 Day '+b.ageInDays;if(b.workplace)sub+=' \u00b7 '+esc(b.workplace);return'<div class="col-sm-6 col-md-4 col-xl-3"><div class="card bg-body-secondary h-100"><div class="card-body card-sm"><div class="fw-semibold">'+esc(b.name)+'</div><div class="small text-muted mb-1">'+sub+'</div>'+(badges?'<div class="mb-1">'+badges+'</div>':'')+bar(b.hunger,'\uD83C\uDF5E')+bar(b.thirst,'\uD83D\uDCA7')+bar(b.sleep,'\uD83D\uDE34')+((b.hasJob&&b.isAdult)?'<button type="button" class="btn btn-outline-danger btn-sm mt-1 w-100" onclick="TAC.dismiss(\''+b.id+'\')">Dismiss</button>':'')+'</div></div></div>';}).join('');beaverHtml='<div class="row g-2">'+cards+'</div>';}return'<div class="container-fluid py-3">'+summary+beaverHtml+'</div>';}
+
+// ── Automation ────────────────────────────────────────────────────────────────
+function renderAutomation(){return S.automationView==='edit'?renderRuleEditor():renderRuleList();}
+function modeBadgeHtml(mode){var l={simple:'Simple',fbd:'FBD',code:'Code'},c={simple:'tac-mode-simple',fbd:'tac-mode-fbd',code:'tac-mode-code'};return'<span class="badge '+(c[mode]||'bg-secondary')+'">'+(l[mode]||mode)+'</span>';}
+function ruleDescription(r){if(r.mode==='simple'){var sim=r.simple,cond=sim&&sim.conditions&&sim.conditions[0],act=sim&&sim.actions&&sim.actions[0];var condStr=cond?(cond.type==='adapter'?(esc(cond.adapterName)+' is '+cond.adapterState.toUpperCase()):cond.type==='lever'?(esc(cond.leverName)+' is '+cond.leverState.toUpperCase()):cond.type==='sensor'?(esc(cond.sensorName)+' '+cond.sensorState.toUpperCase()):cond.type==='sensor_value'?(esc(cond.sensorName)+' '+(cond.op||'gte')+' '+(cond.threshold||0)):cond.type==='gamestate'?esc(cond.field):cond.type==='time'?('Time '+cond.fromHour+'\u2013'+cond.toHour+'h'):cond.type==='population'?(esc(cond.field)+' '+cond.op+' '+cond.threshold):'?'):'(no conditions)';var extra=(sim&&sim.conditions&&sim.conditions.length>1)?' <span class="text-muted">+'+(sim.conditions.length-1)+' more</span>':'';var actStr=act?('Set <strong>'+esc(act.leverName)+'</strong> '+act.leverState.toUpperCase()):'(no actions)';return condStr+extra+' \u2192 '+actStr;}if(r.mode==='code'){var lines=(r.code&&r.code.script||'').split('\n').filter(function(l){return l.trim()&&!l.trim().startsWith('//');}); return'<span class="text-muted fst-italic">'+(lines.length?lines.length+' line'+(lines.length>1?'s':'')+' of code':'Empty script')+'</span>';}if(r.mode==='fbd'){var nc=r.fbd&&r.fbd.nodes&&r.fbd.nodes.length;var thumb=r._fbdThumb?'<img src="'+r._fbdThumb+'" onclick="TAC._fbdOpenFullscreen(\''+esc(r.id)+'\')" style="height:38px;border-radius:3px;vertical-align:middle;margin-right:6px;border:1px solid rgba(255,255,255,.12);cursor:pointer" title="Click to open full-screen FBD editor">':'';return thumb+'<span class="text-muted fst-italic">'+(nc?nc+' node'+(nc>1?'s':''):'Empty diagram \u2014 right-click canvas to add nodes')+'</span>';}return'\u2014';}
+
+function renderRuleList() {
+    var warn='';
+    if(!S.adapters.length)warn+='<div class="alert alert-warning py-2 mb-2 small">No HTTP Adapters in game \u2014 place HTTP Adapter buildings to use as triggers.</div>';
+    if(!S.levers.length)  warn+='<div class="alert alert-warning py-2 mb-2 small">No HTTP Levers in game \u2014 place HTTP Lever buildings to control with rules.</div>';
+    // Step 8: DLL warning for automation tab — conditions/FBD nodes needing DLL evaluate to false
+    if(DLL_AVAILABLE===false)warn+='<div class="alert alert-secondary py-2 mb-2 small d-flex align-items-center gap-2"><span>\u26a0\ufe0f</span><span>DLL not loaded \u2014 conditions and FBD nodes that read game state or population will always evaluate to <strong>false</strong>. Adapter-based rules work normally.</span></div>';
+
+    // Header with Export / Import buttons
+    var header='<div class="d-flex align-items-center mb-2 gap-2">'
+              + '<h5 class="mb-0 fw-semibold">\u26a1 Automation Rules</h5>'
+              + '<div class="ms-auto d-flex gap-1">'
+              + '<button type="button" class="btn btn-sm btn-outline-secondary" onclick="TAC.exportRules()" title="Export rules as JSON">\u2191 Export</button>'
+              + '<button type="button" class="btn btn-sm btn-outline-secondary" onclick="TAC.toggleImport()" title="Import rules from JSON">\u2193 Import</button>'
+              + '<button type="button" class="btn btn-sm btn-primary" onclick="TAC.newRule()">+ Add Rule</button>'
+              + '</div></div>';
+
+    // Import panel
+    var importPanel='';
+    if(S.showImport){
+        importPanel='<div class="tac-import-box mb-3">'
+                  + '<div class="text-muted small fw-semibold mb-1">IMPORT RULES FROM JSON</div>'
+                  + '<div class="text-muted small mb-2">Paste exported JSON below. This will <strong>replace</strong> all current rules.</div>'
+                  + '<textarea id="tac-import-ta" class="form-control form-control-sm bg-body-secondary border-secondary text-light mb-2" rows="4" style="font-family:Consolas,monospace;font-size:.78rem" placeholder=\'[{"id":"...","name":"...",...}]\'></textarea>'
+                  + '<div class="d-flex gap-2">'
+                  + '<button type="button" class="btn btn-sm btn-danger" onclick="TAC.importRules()">Replace all rules</button>'
+                  + '<button type="button" class="btn btn-sm btn-outline-secondary" onclick="TAC.toggleImport()">Cancel</button>'
+                  + '</div></div>';
+    }
+
+    if(!S.rules.length){return'<div class="container-fluid py-3">'+warn+header+importPanel+'<div class="card bg-body-secondary"><div class="card-body text-center text-muted py-5"><div class="fs-2 mb-2">\u26a1</div><div class="fw-semibold mb-1">No automation rules yet</div><div class="small mb-3">Rules let you automatically control levers based on adapter states, game conditions, and more.</div><button type="button" class="btn btn-sm btn-primary" onclick="TAC.newRule()">+ Add your first rule</button></div></div></div>';}
+
+    var rows=S.rules.map(function(r,i){
+        var id=esc(r.id),badge=modeBadgeHtml(r.mode),checked=r.enabled?' checked':'';
+        var ftLabel='';if(r.mode==='simple'&&r.simple){if(r.simple.functionType==='timer')ftLabel=' <span class="badge bg-secondary">Timer</span>';if(r.simple.functionType==='latch')ftLabel=' <span class="badge bg-secondary">Latch</span>';}
+        // Error badge
+        var errBadge='';
+        if(r._lastError)errBadge=' <span class="badge bg-danger" title="'+esc(r._lastError)+'">!</span>';
+        else if(r.mode==='code'&&S.codeLogs[r.id]){var hasRecentErr=S.codeLogs[r.id].slice(-5).some(function(l){return l.isErr;});if(hasRecentErr)errBadge=' <span class="badge bg-danger" title="Recent script error">!</span>';}
+        // ↑ ↓ arrows
+        var upBtn=i>0?'<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" style="line-height:1" onclick="TAC.moveRule(\''+id+'\',-1)" title="Move up">\u2191</button>':'<span style="display:inline-block;width:26px"></span>';
+        var dnBtn=i<S.rules.length-1?'<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" style="line-height:1" onclick="TAC.moveRule(\''+id+'\',1)" title="Move down">\u2193</button>':'<span style="display:inline-block;width:26px"></span>';
+        return'<tr class="tac-rule-row align-middle">'
+             +'<td style="width:2.5rem"><div class="form-check form-switch mb-0" style="min-height:0"><input class="form-check-input" type="checkbox" role="switch"'+checked+' onchange="TAC.toggleRule(\''+id+'\')"></div></td>'
+             +'<td style="width:5.5rem">'+badge+ftLabel+errBadge+'</td>'
+             +'<td class="fw-semibold" style="min-width:120px">'+esc(r.name)+'</td>'
+             +'<td class="small text-muted">'+ruleDescription(r)+'</td>'
+             +'<td style="width:8rem" class="text-end">'
+             +upBtn+' '+dnBtn
+             +' <button type="button" class="btn btn-sm btn-outline-secondary" onclick="TAC.editRule(\''+id+'\')" title="Edit">\u270f\ufe0f</button>'
+             +' <button type="button" class="btn btn-sm btn-outline-danger"   onclick="TAC.delRule(\''+id+'\')" title="Delete">\u2715</button>'
+             +'</td></tr>';
+    }).join('');
+    var table='<div class="card bg-body-secondary"><div class="card-body p-0"><table class="table table-sm table-dark table-borderless mb-0"><thead><tr class="border-bottom border-secondary"><th class="ps-3" style="width:2.5rem"></th><th style="width:5.5rem">Mode</th><th>Name</th><th>Description</th><th style="width:8rem"></th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+    return'<div class="container-fluid py-3">'+warn+header+importPanel+table+'</div>';
+}
+
+function renderRuleEditor() {
+    var rule=S.rules.find(function(r){return r.id===S.editingRuleId;});if(!rule)return renderRuleList();
+    var rid=esc(rule.id);
+    function modeCard(value,label,desc){var active=rule.mode===value;return'<div class="col-md-4"><label class="card h-100 p-3 w-100" style="cursor:pointer;border:2px solid '+(active?'#0d6efd':'rgba(255,255,255,.1)')+';background:rgba(255,255,255,.04)"><input type="radio" name="ruleMode" value="'+value+'" class="d-none"'+(active?' checked':'')+' onchange="TAC._setMode(\''+rid+'\',\''+value+'\')"><div class="fw-semibold mb-1">'+modeBadgeHtml(value)+' '+label+'</div><div class="small text-muted">'+desc+'</div></label></div>';}
+    var modeSection='<div class="mb-4"><div class="text-muted small fw-semibold mb-2">MODE</div><div class="row g-2">'+modeCard('simple','Simple','Conditions, function types (Direct / Timer / SR-Latch), and lever actions.')+modeCard('fbd','FBD','Visual function block diagram \u2014 place and wire input, logic, and output nodes.')+modeCard('code','Code','Write a JavaScript snippet that runs every poll cycle (~0.5 s).')+'</div></div>';
+    var editorArea=rule.mode==='simple'?renderSimpleEditor(rule):rule.mode==='code'?renderCodeEditor(rule):renderFbdEditor(rule);
+    // Show per-rule error in editor if present
+    var ruleErr=rule._lastError?'<div class="alert alert-danger py-2 mb-3 small d-flex align-items-center gap-2"><span>\u274c</span><span><strong>Rule error:</strong> '+esc(rule._lastError)+'</span></div>':'';
+    return'<div class="container-fluid py-3"><div class="d-flex align-items-center mb-4 gap-3"><button type="button" class="btn btn-sm btn-outline-secondary" onclick="TAC.cancelEdit()">\u2190 Back</button><h5 class="mb-0 fw-semibold">Edit Rule</h5></div><div class="mb-4"><div class="text-muted small fw-semibold mb-1">RULE NAME</div><input id="editRuleName" type="text" class="form-control bg-body-secondary border-secondary text-light" value="'+esc(rule.name)+'" placeholder="e.g. Night lighting" maxlength="80"></div>'+modeSection+ruleErr+'<div class="mb-4">'+editorArea+'</div><div class="d-flex gap-2 justify-content-end"><button type="button" class="btn btn-outline-secondary" onclick="TAC.cancelEdit()">Cancel</button><button type="button" class="btn btn-primary" onclick="TAC.saveEdit(\''+rid+'\')">Save Rule</button></div></div>';
+}
+
+// ── Latch reset condition builder ─────────────────────────────────────────────
+function renderLatchControls(rule, rid) {
+    var sim=rule.simple;
+    var resetConds=sim.resetConditions||[];
+    var condTypes=[['adapter','Adapter'],['lever','Lever'],['gamestate','Game state'],['time','Time'],['population','Population']];
+    var addSel='<select class="form-select form-select-sm w-auto" onchange="TAC._addResetCond(\''+rid+'\',this.value);this.selectedIndex=0;"><option value="" disabled selected>+ Add reset condition\u2026</option>'+condTypes.map(function(t){return'<option value="'+t[0]+'">'+t[1]+'</option>';}).join('')+'</select>';
+    var resetRows=resetConds.map(function(cond,ci){
+        var controls='';
+        if(cond.type==='adapter'){var adOpts=S.adapters.length?S.adapters.map(function(a){return'<option value="'+esc(a.name)+'"'+(cond.adapterName===a.name?' selected':'')+'>'+esc(a.name)+'</option>';}).join(''):'<option value="">—</option>';controls='<select class="form-select form-select-sm" style="max-width:160px" onchange="TAC._updateResetCond(\''+rid+'\','+ci+',\'adapterName\',this.value)">'+adOpts+'</select><span class="text-muted small mx-1">is</span><select class="form-select form-select-sm" style="max-width:80px" onchange="TAC._updateResetCond(\''+rid+'\','+ci+',\'adapterState\',this.value)"><option value="on"'+(cond.adapterState==='on'?' selected':'')+'>ON</option><option value="off"'+(cond.adapterState==='off'?' selected':'')+'>OFF</option></select>';}
+        if(cond.type==='lever'){var lvOpts=S.levers.length?S.levers.map(function(l){return'<option value="'+esc(l.name)+'"'+(cond.leverName===l.name?' selected':'')+'>'+esc(l.name)+'</option>';}).join(''):'<option value="">—</option>';controls='<select class="form-select form-select-sm" style="max-width:160px" onchange="TAC._updateResetCond(\''+rid+'\','+ci+',\'leverName\',this.value)">'+lvOpts+'</select><span class="text-muted small mx-1">is</span><select class="form-select form-select-sm" style="max-width:80px" onchange="TAC._updateResetCond(\''+rid+'\','+ci+',\'leverState\',this.value)"><option value="on"'+(cond.leverState==='on'?' selected':'')+'>ON</option><option value="off"'+(cond.leverState==='off'?' selected':'')+'>OFF</option></select>';}
+        if(cond.type==='gamestate'){var gsF=[['isDay','Daytime'],['isNight','Nighttime'],['isDrought','Drought'],['isBadtide','Badtide'],['weatherIsHazardous','Any Hazardous']];controls='<select class="form-select form-select-sm" style="max-width:200px" onchange="TAC._updateResetCond(\''+rid+'\','+ci+',\'field\',this.value)">'+gsF.map(function(f){return'<option value="'+f[0]+'"'+(cond.field===f[0]?' selected':'')+'>'+f[1]+'</option>';}).join('')+'</select>';}
+        return'<div class="tac-cond-row d-flex align-items-center gap-2 p-2 mb-1 flex-wrap"><div class="d-flex align-items-center gap-1 flex-wrap">'+controls+'</div><button type="button" class="btn btn-sm btn-outline-danger ms-auto flex-shrink-0" onclick="TAC._removeResetCond(\''+rid+'\','+ci+')">\u2715</button></div>';
+    }).join('');
+    return '<div class="mt-2 border border-secondary rounded p-2" style="background:rgba(255,180,0,.05)">'
+         + '<div class="d-flex align-items-center gap-2 mb-1"><span class="text-muted small fw-semibold">\u21ba AUTO-RESET WHEN</span><div class="ms-auto">'+addSel+'</div></div>'
+         + (resetConds.length?resetRows:'<div class="text-muted small fst-italic py-1">No reset conditions \u2014 use the Reset Latch button manually.</div>')
+         + '<div class="d-flex align-items-center gap-2 mt-2"><button type="button" class="btn btn-sm btn-outline-warning" onclick="TAC.resetLatch(\''+rid+'\')">Reset Latch now</button></div>'
+         + '</div>';
+}
+
+// ── Simple mode editor ────────────────────────────────────────────────────────
+function renderSimpleEditor(rule) {
+    var sim=rule.simple,rid=esc(rule.id);
+    var condTypes=[['adapter','Adapter state'],['lever','Lever state'],['sensor','Sensor signal'],['sensor_value','Sensor value'],['gamestate','Game state'],['time','Time of day'],['population','Population'],['duration','Adapter ON for N sec'],['popchange','Population rate'],['daycycle','Day of cycle']];
+    var addCondSel='<select class="form-select form-select-sm w-auto" onchange="TAC._addCondition(\''+rid+'\',this.value);this.selectedIndex=0;"><option value="" disabled selected>+ Add condition\u2026</option>'+condTypes.map(function(t){return'<option value="'+t[0]+'">'+t[1]+'</option>';}).join('')+'</select>';
+    var condModeToggle=sim.conditions.length>1?' <span class="text-muted small ms-1">Match</span> '+['and','or'].map(function(m){return'<button type="button" class="btn btn-xs btn-'+(sim.conditionMode===m?'primary':'outline-secondary')+' btn-sm py-0 px-2" onclick="TAC._setCondMode(\''+rid+'\',\''+m+'\')">'+m.toUpperCase()+'</button>';}).join(' '):'';
+    var condRows=sim.conditions.map(function(cond,ci){
+        var controls='',typeLabel={adapter:'Adapter',lever:'Lever',sensor:'Sensor',sensor_value:'Sensor',gamestate:'Game state',time:'Time',population:'Population',duration:'Duration',popchange:'Pop.Rate',daycycle:'Day'}[cond.type]||cond.type;
+        if(cond.type==='lever'){var lvOpts=S.levers.length?S.levers.map(function(l){return'<option value="'+esc(l.name)+'"'+(cond.leverName===l.name?' selected':'')+'>'+esc(l.name)+'</option>';}).join(''):'<option value="">— no levers —</option>';controls='<select class="form-select form-select-sm" style="max-width:180px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'leverName\',this.value)">'+lvOpts+'</select><span class="text-muted small mx-1">is</span><select class="form-select form-select-sm" style="max-width:90px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'leverState\',this.value)"><option value="on"'+(cond.leverState==='on'?' selected':'')+'>ON</option><option value="off"'+(cond.leverState==='off'?' selected':'')+'>OFF</option></select>';}
+        if(cond.type==='sensor'){var snOpts=S.sensors.length?S.sensors.map(function(s){return'<option value="'+esc(s.name)+'"'+(cond.sensorName===s.name?' selected':'')+'>'+esc(s.name)+'</option>';}).join(''):'<option value="">— no sensors —</option>';controls='<select class="form-select form-select-sm" style="max-width:180px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'sensorName\',this.value)">'+snOpts+'</select><span class="text-muted small mx-1">signal is</span><select class="form-select form-select-sm" style="max-width:100px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'sensorState\',this.value)"><option value="on"'+(cond.sensorState==='on'?' selected':'')+'>ON</option><option value="off"'+(cond.sensorState==='off'?' selected':'')+'>OFF</option></select>';}
+        if(cond.type==='sensor_value'){var svOpts=S.sensors.length?S.sensors.map(function(s){return'<option value="'+esc(s.name)+'"'+(cond.sensorName===s.name?' selected':'')+'>'+esc(s.name)+'</option>';}).join(''):'<option value="">— no sensors —</option>';var selSvn=S.sensors.find(function(s){return s.name===cond.sensorName;});var svUnit=selSvn&&selSvn.unit?selSvn.unit:'';var svNoVal=selSvn&&(selSvn.value===null||selSvn.value===undefined);var svOps=[['gt','>'],['gte','\u2265'],['lt','<'],['lte','\u2264'],['eq','=']];controls='<select class="form-select form-select-sm" style="max-width:170px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'sensorName\',this.value)">'+svOpts+'</select><select class="form-select form-select-sm" style="max-width:68px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'op\',this.value)">'+svOps.map(function(o){return'<option value="'+o[0]+'"'+(cond.op===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select><input type="number" class="form-control form-control-sm" style="width:80px" step="any" value="'+(cond.threshold||0)+'" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'threshold\',+this.value)">'+(svUnit?'<span class="text-muted small ms-1">'+esc(svUnit)+'</span>':'')+(svNoVal?'<span class="text-muted small ms-1" title="Numeric value not yet available from this sensor type \u2014 will use isOn signal as fallback">\u26a0 uses signal</span>':'');}
+        if(cond.type==='adapter'){var adOpts=S.adapters.length?S.adapters.map(function(a){return'<option value="'+esc(a.name)+'"'+(cond.adapterName===a.name?' selected':'')+'>'+esc(a.name)+'</option>';}).join(''):'<option value="">— no adapters —</option>';controls='<select class="form-select form-select-sm" style="max-width:180px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'adapterName\',this.value)">'+adOpts+'</select><span class="text-muted small mx-1">is</span><select class="form-select form-select-sm" style="max-width:90px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'adapterState\',this.value)"><option value="on"'+(cond.adapterState==='on'?' selected':'')+'>ON</option><option value="off"'+(cond.adapterState==='off'?' selected':'')+'>OFF</option></select>';}
+        if(cond.type==='gamestate'){var gsF=[['isDay','Daytime'],['isNight','Nighttime'],['isDrought','Drought'],['isBadtide','Badtide'],['isHazardous','Hazardous (legacy)'],['weatherIsHazardous','Any Hazardous Weather']];controls='<select class="form-select form-select-sm" style="max-width:220px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'field\',this.value)">'+gsF.map(function(f){return'<option value="'+f[0]+'"'+(cond.field===f[0]?' selected':'')+'>'+f[1]+'</option>';}).join('')+'</select><span class="text-muted small ms-1">is active</span>';}
+        if(cond.type==='time'){controls='<span class="text-muted small">From</span><input type="number" class="form-control form-control-sm" style="width:68px" min="0" max="23" step="0.5" value="'+(cond.fromHour||0)+'" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'fromHour\',+this.value)"><span class="text-muted small">to</span><input type="number" class="form-control form-control-sm" style="width:68px" min="0" max="23" step="0.5" value="'+(cond.toHour||12)+'" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'toHour\',+this.value)"><span class="text-muted small">h</span>';}
+        if(cond.type==='population'){var pF=[['totalBeavers','Total pop.'],['adults','Adults'],['children','Children'],['unemployed','Idle'],['homeless','Homeless'],['injured','Injured'],['contaminated','Contaminated']],ops=[['gt','>'],['gte','\u2265'],['lt','<'],['lte','\u2264'],['eq','=']];controls='<select class="form-select form-select-sm" style="max-width:150px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'field\',this.value)">'+pF.map(function(f){return'<option value="'+f[0]+'"'+(cond.field===f[0]?' selected':'')+'>'+f[1]+'</option>';}).join('')+'</select><select class="form-select form-select-sm" style="max-width:68px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'op\',this.value)">'+ops.map(function(o){return'<option value="'+o[0]+'"'+(cond.op===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select><input type="number" class="form-control form-control-sm" style="width:76px" min="0" step="1" value="'+(cond.threshold||0)+'" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'threshold\',+this.value)">';}
+        if(cond.type==='duration'){var adD=S.adapters.length?S.adapters.map(function(a){return'<option value="'+esc(a.name)+'"'+(cond.adapterName===a.name?' selected':'')+'>'+esc(a.name)+'</option>';}).join(''):'<option value="">— no adapters —</option>';controls='<select class="form-select form-select-sm" style="max-width:160px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'adapterName\',this.value)">'+adD+'</select><span class="text-muted small mx-1">ON for</span><input type="number" class="form-control form-control-sm" style="width:68px" min="1" max="86400" step="1" value="'+(cond.durationSec||10)+'" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'durationSec\',+this.value)"><span class="text-muted small ms-1">s</span>';}
+        if(cond.type==='popchange'){var pcF=[['totalBeavers','Total'],['adults','Adults'],['children','Children'],['unemployed','Idle'],['homeless','Homeless'],['injured','Injured'],['contaminated','Contaminated']];controls='<select class="form-select form-select-sm" style="max-width:140px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'field\',this.value)">'+pcF.map(function(f){return'<option value="'+f[0]+'"'+(cond.field===f[0]?' selected':'')+'>'+f[1]+'</option>';}).join('')+'</select><span class="text-muted small mx-1">is</span><select class="form-select form-select-sm" style="max-width:100px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'direction\',this.value)"><option value="growing"'+(cond.direction==='growing'?' selected':'')+'>growing</option><option value="shrinking"'+(cond.direction!=='growing'?' selected':'')+'>shrinking</option></select>';}
+        if(cond.type==='daycycle'){var dcOps=[['gt','>'],['gte','\u2265'],['lt','<'],['lte','\u2264'],['eq','=']];controls='<span class="text-muted small me-1">Day of cycle</span><select class="form-select form-select-sm" style="max-width:70px" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'op\',this.value)">'+dcOps.map(function(o){return'<option value="'+o[0]+'"'+(cond.op===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select><input type="number" class="form-control form-control-sm" style="width:70px" min="1" max="999" step="1" value="'+(cond.threshold||1)+'" onchange="TAC._updateCondition(\''+rid+'\','+ci+',\'threshold\',+this.value)">';}
+        return'<div class="tac-cond-row d-flex align-items-center gap-2 p-2 mb-1 flex-wrap"><span class="badge bg-dark border border-secondary" style="min-width:76px;font-size:.75em">'+typeLabel+'</span><div class="d-flex align-items-center gap-1 flex-wrap">'+controls+'</div><button type="button" class="btn btn-sm btn-outline-danger ms-auto flex-shrink-0" onclick="TAC._removeCondition(\''+rid+'\','+ci+')">\u2715</button></div>';
+    }).join('');
+    var condSection='<div class="mb-0"><div class="d-flex align-items-center mb-2 gap-2"><span class="badge bg-primary small py-1 px-2">IF</span><span class="text-muted small fw-semibold text-uppercase">Conditions</span>'+condModeToggle+'<div class="ms-auto">'+addCondSel+'</div></div>'+(!sim.conditions.length?'<div class="text-muted small py-2 fst-italic">No conditions \u2014 add at least one for this rule to fire.</div>':'')+condRows+'</div>';
+    var ft=sim.functionType||'direct';var ftDescs={trigger:'Fires <strong>once</strong> when conditions become true (rising edge). Does nothing while conditions stay true — waits for them to go false then true again.',direct:'Re-applies actions on every poll cycle (~0.5 s) while conditions are true. Use when you need to enforce a state continuously.',timer:'Conditions must stay true for the full delay before actions fire. Timer resets if conditions become false.',latch:'Actions fire once when conditions first become true. Stays fired until reset.'};
+    var ftSection='<div class="mb-0"><div class="d-flex align-items-center mb-2 gap-2"><span class="badge bg-secondary small py-1 px-2">THEN</span><span class="text-muted small fw-semibold text-uppercase">Function Type</span></div><div class="btn-group btn-group-sm mb-2">'+[['trigger','Trigger'],['direct','Enforce'],['timer','Timer'],['latch','SR-Latch']].map(function(f){return'<button type="button" class="btn btn-sm btn-'+(ft===f[0]?'primary':'outline-secondary')+'" onclick="TAC._setFuncType(\''+rid+'\',\''+f[0]+'\')">' +f[1]+'</button>';}).join('')+'</div><div class="small text-muted">'+ftDescs[ft]+'</div>'+(ft==='timer'?'<div class="d-flex align-items-center gap-2 mt-2"><span class="text-muted small">Fire after</span><input type="number" class="form-control form-control-sm" style="width:82px" min="1" step="1" value="'+(sim.timerSeconds||10)+'" onchange="TAC._setTimerSec(\''+rid+'\',+this.value)"><span class="text-muted small">seconds</span></div>':'')+(ft==='latch'?renderLatchControls(rule,rid):'')+'</div>';
+    var actRows=(sim.actions||[]).map(function(act,ai){
+        var lvOpts=S.levers.length?S.levers.map(function(l){return'<option value="'+esc(l.name)+'"'+(act.leverName===l.name?' selected':'')+'>'+esc(l.name)+'</option>';}).join(''):'<option value="">— no levers —</option>';
+        var isColor=act.leverState==='color';
+        var stateOpts=['on','off','color'].map(function(v){return'<option value="'+v+'"'+(act.leverState===v?' selected':'')+'>'+v.toUpperCase()+'</option>';}).join('');
+        var colorExtra=isColor
+            ? '<input type="color" value="#'+(act.leverColor||'ffffff')+'"'
+            +   ' style="width:28px;height:28px;padding:1px;border:1px solid rgba(255,255,255,.25);border-radius:.25rem;background:transparent;cursor:pointer;flex-shrink:0"'
+            +   ' oninput="TAC._updateAction(\''+rid+'\','+ai+',\'leverColor\',this.value.slice(1))">'
+            + '<input type="text" value="'+(act.leverColor||'ffffff')+'" maxlength="6"'
+            +   ' style="width:62px;font-size:.75rem;font-family:monospace;background:#1a1f2e;border:1px solid rgba(255,255,255,.2);border-radius:.25rem;color:#e6edf3;padding:.1rem .3rem"'
+            +   ' oninput="TAC._updateAction(\''+rid+'\','+ai+',\'leverColor\',this.value)">'
+            : '';
+        return'<div class="tac-cond-row d-flex align-items-center gap-2 p-2 mb-1"><span class="text-muted small">Set</span>'
+            +'<select class="form-select form-select-sm" style="max-width:180px" onchange="TAC._updateAction(\''+rid+'\','+ai+',\'leverName\',this.value)">'+lvOpts+'</select>'
+            +'<span class="text-muted small">to</span>'
+            +'<select class="form-select form-select-sm" style="max-width:90px" onchange="TAC._updateAction(\''+rid+'\','+ai+',\'leverState\',this.value)">'+stateOpts+'</select>'
+            +colorExtra
+            +'<button type="button" class="btn btn-sm btn-outline-danger ms-auto flex-shrink-0" onclick="TAC._removeAction(\''+rid+'\','+ai+')">\u2715</button></div>';
+    }).join('');
+    var actSection='<div class="mb-0"><div class="d-flex align-items-center mb-2 gap-2"><span class="badge bg-success small py-1 px-2">DO</span><span class="text-muted small fw-semibold text-uppercase">Actions</span><div class="ms-auto"><button type="button" class="btn btn-sm btn-outline-primary" onclick="TAC._addAction(\''+rid+'\')">+ Add Action</button></div></div>'+(!(sim.actions||[]).length?'<div class="text-muted small py-2 fst-italic">No actions \u2014 add at least one lever to control.</div>':'')+actRows+'</div>';
+    return'<div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">'
+        +'<div class="card" style="flex:1;min-width:190px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1)"><div class="card-body p-2">'+condSection+'</div></div>'
+        +'<div class="d-flex align-items-start justify-content-center text-muted" style="padding-top:.6rem;font-size:1.1rem;flex-shrink:0">\u2192</div>'
+        +'<div class="card" style="flex:0 0 220px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1)"><div class="card-body p-2">'+ftSection+'</div></div>'
+        +'<div class="d-flex align-items-start justify-content-center text-muted" style="padding-top:.6rem;font-size:1.1rem;flex-shrink:0">\u2192</div>'
+        +'<div class="card" style="flex:1;min-width:190px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1)"><div class="card-body p-2">'+actSection+'</div></div>'
+        +'</div>';
+}
+
+// ── Code mode editor ──────────────────────────────────────────────────────────
+function renderCodeEditor(rule){
+    var rid=esc(rule.id),script=(rule.code&&rule.code.script)||'';
+    // Live state sidebar
+    var adRows=S.adapters.map(function(a){return'<div style="display:flex;justify-content:space-between;padding:1px 0;font-size:.75rem"><span style="color:#8b949e">'+esc(a.name)+'</span><span style="color:'+(a.state?'#00d000':'#6c757d')+'">'+(a.state?'ON':'OFF')+'</span></div>';}).join('')||'<div style="color:#6c757d;font-size:.75rem">none</div>';
+    var lvRows=S.levers.map(function(l){return'<div style="display:flex;justify-content:space-between;padding:1px 0;font-size:.75rem"><span style="color:#8b949e">'+esc(l.name)+'</span><span style="color:'+(l.state?'#00d000':'#6c757d')+'">'+(l.state?'ON':'OFF')+'</span></div>';}).join('')||'<div style="color:#6c757d;font-size:.75rem">none</div>';
+    var stateSidebar='<div style="width:180px;flex-shrink:0;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.1);border-radius:.375rem;padding:.6rem;font-family:Consolas,monospace;overflow-y:auto;max-height:380px">'
+        +'<div style="color:#e3b341;font-size:.7rem;font-weight:600;text-transform:uppercase;margin-bottom:.4rem">Adapters</div>'+adRows
+        +'<div style="color:#e3b341;font-size:.7rem;font-weight:600;text-transform:uppercase;margin:.7rem 0 .4rem">Levers</div>'+lvRows
+        +'</div>';
+    var refCard='<div class="card mb-3" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1)"><div class="card-body py-2 px-3"><div class="text-muted small fw-semibold mb-2">AVAILABLE IN SCRIPT</div><div class="row g-2 small"><div class="col-md-6"><code class="text-warning">adapters</code> <span class="text-muted">\u2014 array of <code>{name, state}</code></span></div><div class="col-md-6"><code class="text-warning">levers</code> <span class="text-muted">\u2014 array of <code>{name, state}</code> (read-only)</span></div><div class="col-md-6"><code class="text-warning">sensors</code> <span class="text-muted">\u2014 array of <code>{id, name, type, unit, isOn, value}</code></span></div><div class="col-md-6"><code class="text-warning">gameState</code> <span class="text-muted">\u2014 <code>{cycleNumber, dayNumber, timeOfDayHours, isDay, isNight, isDrought, isBadtide, isHazardous, weatherId, weatherIsHazardous, weatherDaysRemaining}</code> or null</span></div><div class="col-md-6"><code class="text-warning">population</code> <span class="text-muted">\u2014 <code>{totalBeavers, adults, children, unemployed, homeless, injured, contaminated}</code> or null</span></div><div class="col-md-6"><code class="text-success">setLever(name, state)</code> <span class="text-muted">\u2014 <code>\'on\'</code> or <code>\'off\'</code></span></div><div class="col-md-6"><code class="text-success">log(msg)</code> <span class="text-muted">\u2014 appends to console below</span></div></div><div class="mt-2 text-muted" style="font-size:.75rem">Script runs every ~0.5 s while enabled. Errors appear in console and as a badge on the rule list.</div></div></div>';
+    return'<div class="card" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1)"><div class="card-body">'+refCard
+        +'<div style="display:flex;gap:8px;align-items:flex-start">'
+        +stateSidebar
+        +'<div style="flex:1;min-width:0">'
+        +'<div class="d-flex align-items-center mb-1"><span class="text-muted small fw-semibold text-uppercase">Script</span>'
+        +'<button type="button" class="btn btn-sm btn-outline-secondary ms-auto py-0 px-2" style="font-size:.75rem" onclick="TAC._copyForAI(\''+rid+'\')">\uD83D\uDCCB Copy for AI</button>'
+        +'</div>'
+        +'<textarea id="tac-code-textarea" class="tac-code-area" rows="14" oninput="TAC._saveCode(\''+rid+'\')" spellcheck="false" autocorrect="off" autocapitalize="off">'+esc(script)+'</textarea>'
+        +'<div class="d-flex align-items-center mb-1 mt-3"><span class="text-muted small fw-semibold text-uppercase">\uD83D\uDDA5\ufe0f Console</span><button type="button" class="btn btn-sm btn-outline-secondary ms-auto py-0 px-2" style="font-size:.75rem" onclick="TAC._clearLog(\''+rid+'\')">Clear</button></div>'
+        +'<div id="tac-code-log" class="tac-log-panel">'+renderCodeLogLines(rule.id)+'</div>'
+        +'</div></div>'
+        +'</div></div>';
+}
+
+// ── Logs tab ──────────────────────────────────────────────────────────────────
+function renderLogLines() {
+    var filtered = S.logFilter === 'all' ? S.uiLog
+        : S.uiLog.filter(function(e) { return e.level === S.logFilter; });
+    if (!filtered.length) {
+        return '<div class="text-muted text-center py-4 small fst-italic">No log entries yet.'
+             + (S.logFilter !== 'all' ? ' Try switching to <strong>All</strong>.' : '')
+             + '</div>';
+    }
+    var levelStyle = {
+        ok:   'color:#00cc44',
+        info: 'color:#6e7681',
+        warn: 'color:#e3b341',
+        err:  'color:#f85149',
+        rule: 'color:#4d9fff',
+        sync: 'color:#bc8cff'
+    };
+    var levelLabel = { ok:'OK  ', info:'INFO', warn:'WARN', err:'ERR ', rule:'RULE', sync:'SYNC' };
+    return filtered.map(function(e) {
+        var style = levelStyle[e.level] || 'color:#aaa';
+        var label = levelLabel[e.level] || (e.level.toUpperCase() + '    ').slice(0,4);
+        return '<div class="tac-log-line">'
+             + '<span class="tac-log-time">' + esc(e.time) + '</span>'
+             + '<span style="' + style + ';font-weight:600;margin-right:.5em;font-size:.75rem">' + label + '</span>'
+             + esc(e.msg)
+             + '</div>';
+    }).join('');
+}
+
+function renderLogs() {
+    var filters = [['all','All'],['ok','OK'],['rule','Rule'],['sync','Sync'],['warn','Warn'],['err','Error']];
+    var filterBtns = filters.map(function(f) {
+        var active = S.logFilter === f[0];
+        return '<button type="button" class="btn btn-sm btn-' + (active ? 'primary' : 'outline-secondary') + '"'
+             + ' onclick="TAC._setLogFilter(\'' + f[0] + '\')">' + f[1] + '</button>';
+    }).join('');
+    var header = '<div class="d-flex align-items-center mb-3 gap-2">'
+               + '<h5 class="mb-0 fw-semibold">\uD83D\uDDC3\ufe0f Activity Log</h5>'
+               + '<div class="btn-group btn-group-sm ms-3">' + filterBtns + '</div>'
+               + '<span class="text-muted small ms-2">' + S.uiLog.length + ' entries</span>'
+               + '<button type="button" class="btn btn-sm btn-outline-info ms-auto" onclick="TAC._saveLog()">Save to file</button>'
+               + ' <button type="button" class="btn btn-sm btn-outline-secondary" onclick="TAC._clearUiLog()">Clear</button>'
+               + '</div>'
+               + '<div class="text-muted small mb-3" style="font-size:.72rem">'
+               + 'Frontend activity log. Cross-reference with <code>debug.log</code> in the mod folder for backend events.'
+               + '</div>';
+    var panel = '<div id="tac-log-panel" class="tac-log-panel" style="max-height:calc(100vh - 200px);min-height:300px">'
+              + renderLogLines()
+              + '</div>';
+    return '<div class="container-fluid py-3">' + header + panel + '</div>';
+}
+
+// ── Boot guard — must run before window.TAC is assigned ──────────────────────
+// The page loads /automation.js twice (double-registration bug in backend).
+// Without this guard here, copy 2 overwrites window.TAC with a fresh S object
+// (tab:'dashboard') before hitting the old guard at the bottom — so every button
+// call uses the stale S and renders dashboard silently.
+if(window.__TAC__)return;
+window.__TAC__=true;
+
+// ── Public callbacks ──────────────────────────────────────────────────────────
+window.TAC = {
+    on:function(name){var l=S.levers.find(function(x){return x.name===name;});if(!l)return;post(l.switchOnUrl).then(function(r){if(r.ok){l.state=true;render();}}).catch(function(e){showErr(e.message);});},
+    off:function(name){var l=S.levers.find(function(x){return x.name===name;});if(!l)return;post(l.switchOffUrl).then(function(r){if(r.ok){l.state=false;render();}}).catch(function(e){showErr(e.message);});},
+    color:function(name,hex){
+        var l=S.levers.find(function(x){return x.name===name;});if(!l||!l.colorUrl)return;
+        hex=(hex||'ffffff').replace(/^#/,'').slice(0,6).toLowerCase();
+        if(!/^[0-9a-f]{6}$/.test(hex)){showErr('Invalid hex color: '+hex);return;}
+        post(l.colorUrl.replace('{color}',hex))
+            .then(function(r){if(!r.ok)uiLog('warn','Color set HTTP '+r.status+' for "'+name+'"');})
+            .catch(function(e){showErr(e.message);});
+    },
+    // Legacy aliases kept for any automation rules that stored 'red'/'green' leverState
+    red:function(name){TAC.color(name,'ff0000');},
+    green:function(name){TAC.color(name,'00ff00');},
+    dismiss:function(id){post('/api/beavers/'+id+'/dismiss').then(function(r){if(r.ok){S.beaversLoaded=false;poll();}else showErr('Dismiss failed: '+r.status);}).catch(function(e){showErr(e.message);});},
+
+    // ── Rule list ─────────────────────────────────────────────────────────────
+    toggleRule:function(id){var r=S.rules.find(function(r){return r.id===id;});if(!r)return;r.enabled=!r.enabled;saveRules();try{localStorage.removeItem('tac_rules');}catch(e){}render();},
+    delRule:function(id){var idx=S.rules.findIndex(function(r){return r.id===id;});if(idx===-1)return;if(S.editingRuleId===id){fbdDetach();S.automationView='list';S.editingRuleId=null;}S.rules.splice(idx,1);saveRules();try{localStorage.removeItem('tac_rules');}catch(e){}render();},
+    editRule:function(id){if(!S.rules.find(function(r){return r.id===id;}))return;S.editingRuleId=id;S.automationView='edit';render();},
+    newRule:function(){var rule=makeRule('New Rule','simple');S.rules.push(rule);saveRules();S.editingRuleId=rule.id;S.automationView='edit';render();},
+    cancelEdit:function(){fbdDetach();S.automationView='list';S.editingRuleId=null;render();},
+    saveEdit:function(id){var rule=S.rules.find(function(r){return r.id===id;});if(rule){var nameEl=document.getElementById('editRuleName');if(nameEl&&nameEl.value.trim())rule.name=nameEl.value.trim();if(rule.mode==='code'){var ta=document.getElementById('tac-code-textarea');if(ta){if(!rule.code)rule.code={};rule.code.script=ta.value;}}}fbdDetach();saveRules();S.automationView='list';S.editingRuleId=null;render();},
+
+    // Move rule up (-1) or down (+1) in the list
+    moveRule:function(id,dir){var idx=S.rules.findIndex(function(r){return r.id===id;});if(idx===-1)return;var newIdx=idx+dir;if(newIdx<0||newIdx>=S.rules.length)return;var tmp=S.rules[idx];S.rules[idx]=S.rules[newIdx];S.rules[newIdx]=tmp;saveRules();render();},
+
+    // Export all rules as JSON to clipboard
+    exportRules:function(){
+        var json=JSON.stringify(S.rules,function(k,v){return(k.startsWith('_')||k==='lastError')?undefined:v;},2);
+        if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(json).then(function(){showOk('\u2713 Copied '+S.rules.length+' rule'+(S.rules.length!==1?'s':'')+' to clipboard');}).catch(function(){showErr('Copy failed \u2014 open console and copy manually');console.log(json);});}
+        else{var ta=document.createElement('textarea');ta.value=json;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');showOk('\u2713 Copied to clipboard');}catch(e){showErr('Copy failed');}document.body.removeChild(ta);}
+    },
+
+    // Toggle import panel
+    toggleImport:function(){S.showImport=!S.showImport;render();},
+
+    // Import rules from JSON in the textarea
+    importRules:function(){
+        var ta=document.getElementById('tac-import-ta');if(!ta||!ta.value.trim()){showErr('Paste JSON first');return;}
+        try{
+            var imported=JSON.parse(ta.value.trim());
+            if(!Array.isArray(imported))throw new Error('Expected a JSON array');
+            // Validate minimally: each item needs id, name, mode
+            imported.forEach(function(r,i){if(!r.id||!r.name||!r.mode)throw new Error('Item '+i+' missing id/name/mode');});
+            // Ensure sub-objects exist
+            imported=imported.map(function(r){return Object.assign({},makeRule(r.name,r.mode),r);});
+            S.rules=imported;saveRules();S.showImport=false;showOk('\u2713 Imported '+imported.length+' rule'+(imported.length!==1?'s':''));render();
+        }catch(e){showErr('Import failed: '+e.message);}
+    },
+
+    // ── Editor ────────────────────────────────────────────────────────────────
+    _setMode:function(id,mode){var rule=S.rules.find(function(r){return r.id===id;});if(!rule)return;if(rule.mode==='code'){var ta=document.getElementById('tac-code-textarea');if(ta){if(!rule.code)rule.code={};rule.code.script=ta.value;}}if(rule.mode==='fbd')fbdDetach();rule.mode=mode;saveRules();render();},
+    _addCondition:function(id,type){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;var d={adapter:{type:'adapter',adapterName:(S.adapters[0]&&S.adapters[0].name)||'',adapterState:'on'},lever:{type:'lever',leverName:(S.levers[0]&&S.levers[0].name)||'',leverState:'on'},sensor:{type:'sensor',sensorName:(S.sensors[0]&&S.sensors[0].name)||'',sensorState:'on'},sensor_value:{type:'sensor_value',sensorName:(S.sensors[0]&&S.sensors[0].name)||'',op:'gte',threshold:0},gamestate:{type:'gamestate',field:'isDay'},time:{type:'time',fromHour:6,toHour:20},population:{type:'population',field:'homeless',op:'gt',threshold:0},duration:{type:'duration',adapterName:(S.adapters[0]&&S.adapters[0].name)||'',durationSec:10},popchange:{type:'popchange',field:'totalBeavers',direction:'growing'},daycycle:{type:'daycycle',op:'gt',threshold:1}};if(!d[type])return;r.simple.conditions.push(d[type]);saveRules();render();},
+    _addResetCond:function(id,type){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;if(!r.simple.resetConditions)r.simple.resetConditions=[];if(!r.simple.resetCondMode)r.simple.resetCondMode='or';var d={adapter:{type:'adapter',adapterName:(S.adapters[0]&&S.adapters[0].name)||'',adapterState:'off'},lever:{type:'lever',leverName:(S.levers[0]&&S.levers[0].name)||'',leverState:'off'},gamestate:{type:'gamestate',field:'isDay'},time:{type:'time',fromHour:0,toHour:6},population:{type:'population',field:'homeless',op:'eq',threshold:0}};if(!d[type])return;r.simple.resetConditions.push(d[type]);saveRules();render();},
+    _removeResetCond:function(id,idx){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple||!r.simple.resetConditions)return;r.simple.resetConditions.splice(idx,1);saveRules();render();},
+    _updateResetCond:function(id,idx,key,value){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple||!r.simple.resetConditions||!r.simple.resetConditions[idx])return;r.simple.resetConditions[idx][key]=value;saveRules();render();},
+    _removeCondition:function(id,idx){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;r.simple.conditions.splice(idx,1);saveRules();render();},
+    _updateCondition:function(id,idx,key,value){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple||!r.simple.conditions[idx])return;r.simple.conditions[idx][key]=value;saveRules();render();},
+    _setCondMode:function(id,mode){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;r.simple.conditionMode=mode;saveRules();render();},
+    _setFuncType:function(id,ft){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;r.simple.functionType=ft;saveRules();render();},
+    _setTimerSec:function(id,val){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;r.simple.timerSeconds=val>0?val:1;saveRules();},
+    _addAction:function(id){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;r.simple.actions.push({leverName:(S.levers[0]&&S.levers[0].name)||'',leverState:'on'});saveRules();render();},
+    _removeAction:function(id,idx){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple)return;r.simple.actions.splice(idx,1);saveRules();render();},
+    _updateAction:function(id,idx,key,value){var r=S.rules.find(function(r){return r.id===id;});if(!r||!r.simple||!r.simple.actions[idx])return;r.simple.actions[idx][key]=value;saveRules();render();},
+    _saveCode:function(id){var r=S.rules.find(function(r){return r.id===id;});if(!r)return;var ta=document.getElementById('tac-code-textarea');if(!ta)return;if(!r.code)r.code={};r.code.script=ta.value;saveRules();},
+    _clearLog:function(id){S.codeLogs[id]=[];var el=document.getElementById('tac-code-log');if(el)el.innerHTML=renderCodeLogLines(id);},
+    _copyForAI:function(id){
+        var r=S.rules.find(function(r){return r.id===id;});
+        var script=(r&&r.code&&r.code.script)||'';
+        var gs=S.gameState;
+        var pop=S.population;
+        var txt='# HTTPAutomation Code Rule — AI Context\n\n'
+            +'## Adapters (read-only inputs)\nadapters = '+JSON.stringify(S.adapters.map(function(a){return{name:a.name,state:a.state};}),null,2)+'\n\n'
+            +'## Levers (outputs)\nlevers = '+JSON.stringify(S.levers.map(function(l){return{name:l.name,state:l.state};}),null,2)+'\n\n'
+            +'## Sensors (automation buildings)\nsensors = '+JSON.stringify(S.sensors.map(function(s){return{name:s.name,type:s.type,unit:s.unit,isOn:s.isOn,value:s.value};}),null,2)+'\n\n'
+            +(gs?'## Game State\ngameState = '+JSON.stringify({cycleNumber:gs.cycleNumber,dayNumber:gs.dayNumber,timeOfDayHours:gs.timeOfDayHours,isDay:gs.isDay,isNight:gs.isNight,isDrought:gs.isDrought,isBadtide:gs.isBadtide,weatherId:gs.weatherId,weatherIsHazardous:gs.weatherIsHazardous,weatherDaysRemaining:gs.weatherDaysRemaining},null,2)+'\n\n':'## Game State\ngameState = null  // DLL not loaded\n\n')
+            +(pop?'## Population\npopulation = '+JSON.stringify({totalBeavers:pop.totalBeavers,adults:pop.adults,children:pop.children,unemployed:pop.unemployed,homeless:pop.homeless,injured:pop.injured,contaminated:pop.contaminated},null,2)+'\n\n':'## Population\npopulation = null  // DLL not loaded\n\n')
+            +'## Available script API\n// setLever(name, \'on\'|\'off\')  — control a lever\n// log(msg)                    — appears in console below editor\n\n'
+            +'## Current script\n```js\n'+script+'\n```\n\n'
+            +'## Task\n// Describe what you want the script to do:\n';
+        if(navigator.clipboard&&navigator.clipboard.writeText){
+            navigator.clipboard.writeText(txt).then(function(){showOk('\uD83D\uDCCB Copied context to clipboard — paste into an AI chat');}).catch(function(){showErr('Copy failed');});
+        } else {
+            var ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();
+            try{document.execCommand('copy');showOk('\uD83D\uDCCB Copied!');}catch(e){showErr('Copy failed');}
+            document.body.removeChild(ta);
+        }
+    },
+    resetLatch:function(id){var r=S.rules.find(function(r){return r.id===id;});if(r&&r.simple)r.simple._latchFired=false;},
+
+    // ── FBD ───────────────────────────────────────────────────────────────────
+    _fbdAddNode:function(ruleId,type){var rule=S.rules.find(function(r){return r.id===ruleId;});if(!rule||!FBD_DEFS[type])return;fbdPushUndo(rule);var col=rule.fbd.nodes.length%4,row=Math.floor(rule.fbd.nodes.length/4);var node={id:fbdMakeNodeId(),type:type,x:Math.max(0,-FBD.pan.x/FBD.zoom+20+col*170),y:Math.max(0,-FBD.pan.y/FBD.zoom+20+row*110),params:fbdDefaultParams(type)};rule.fbd.nodes.push(node);FBD.selected=node.id;saveRules();fbdRefreshSidebar(rule);fbdDrawCanvas();},
+    _fbdDeleteNode:function(ruleId,nodeId){var rule=S.rules.find(function(r){return r.id===ruleId;});if(!rule)return;fbdPushUndo(rule);if(FBD.selected===nodeId&&FBD.inlineInput){fbdRemoveInlineInput(FBD.inlineInput);FBD.inlineInput=null;}rule.fbd.nodes=rule.fbd.nodes.filter(function(n){return n.id!==nodeId;});rule.fbd.edges=rule.fbd.edges.filter(function(e){return e.fromNodeId!==nodeId&&e.toNodeId!==nodeId;});if(FBD.selected===nodeId)FBD.selected=null;saveRules();fbdRefreshSidebar(rule);fbdDrawCanvas();},
+    _fbdUpdateParam:function(ruleId,nodeId,key,value){var rule=S.rules.find(function(r){return r.id===ruleId;});if(!rule)return;var node=rule.fbd.nodes.find(function(n){return n.id===nodeId;});if(!node)return;if(!node.params)node.params={};node.params[key]=value;saveRules();fbdRefreshSidebar(rule);fbdDrawCanvas();},
+    _fbdOpenFullscreen:function(ruleId){
+        var rule=S.rules.find(function(r){return r.id===ruleId;});if(!rule)return;
+        fbdDetach();
+        // Remove any existing fullscreen overlay
+        var old=document.getElementById('tac-fbd-fullscreen');if(old)old.remove();
+        var overlay=document.createElement('div');overlay.id='tac-fbd-fullscreen';
+        overlay.style.cssText='position:fixed;inset:0;background:#0d1117;z-index:9994;display:flex;flex-direction:column';
+        var hdr=document.createElement('div');
+        hdr.style.cssText='display:flex;align-items:center;gap:.5rem;padding:.35rem .75rem;background:#1a1f2e;border-bottom:1px solid rgba(255,255,255,.15);flex-shrink:0';
+        hdr.innerHTML='<span style="font-size:.85rem;color:#e6edf3;font-weight:600">'+esc(rule.name)+'</span>'
+            +'<span class="text-muted" style="font-size:.72rem">Right-click to add nodes \u2022 Scroll=zoom \u2022 Space+drag=pan \u2022 Del=remove \u2022 F=fit \u2022 Ctrl+Z=undo</span>'
+            +'<button type="button" id="tac-fbd-fs-close" style="margin-left:auto;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);color:#e6edf3;padding:.15rem .55rem;border-radius:.25rem;cursor:pointer;font-size:.85rem">\u2715 Close</button>';
+        var wrap=document.createElement('div');wrap.style.cssText='flex:1;overflow:hidden;position:relative';
+        var canvas=document.createElement('canvas');canvas.id='tac-fbd-canvas';canvas.style.cssText='display:block';
+        wrap.appendChild(canvas);overlay.appendChild(hdr);overlay.appendChild(wrap);document.body.appendChild(overlay);
+        canvas.width=wrap.clientWidth||window.innerWidth;canvas.height=wrap.clientHeight||(window.innerHeight-42);
+        FBD.canvas=canvas;FBD.ctx=canvas.getContext('2d');
+        if(FBD.ruleId!==rule.id){FBD.pan={x:20,y:20};FBD.zoom=1.0;FBD.selected=null;FBD.wire=null;}
+        FBD.ruleId=rule.id;
+        canvas.addEventListener('mousedown',fbdOnMouseDown);canvas.addEventListener('mousemove',fbdOnMouseMove);canvas.addEventListener('mouseup',fbdOnMouseUp);canvas.addEventListener('contextmenu',fbdOnContextMenu);canvas.addEventListener('wheel',fbdOnWheel,{passive:false});
+        document.addEventListener('keydown',fbdOnKeyDown);document.addEventListener('keyup',fbdOnKeyUp);
+        if(rule.fbd&&rule.fbd.nodes&&rule.fbd.nodes.length)fbdFitToScreen();else fbdDrawCanvas();
+        function closeFs(){fbdDetach();overlay.remove();}
+        document.getElementById('tac-fbd-fs-close').addEventListener('click',closeFs);
+        var escFn=function(e){if(e.key==='Escape'){closeFs();document.removeEventListener('keydown',escFn);}};
+        document.addEventListener('keydown',escFn);
+    },
+
+    // ── Logs tab ──────────────────────────────────────────────────────────────
+    _setLogFilter:function(f){S.logFilter=f;render();},
+    _clearUiLog:function(){S.uiLog=[];render();},
+    _saveLog:function(){
+        var levelLabel={ok:'OK  ',info:'INFO',warn:'WARN',err:'ERR ',rule:'RULE',sync:'SYNC'};
+        var lines=S.uiLog.map(function(e){
+            var label=levelLabel[e.level]||(e.level.toUpperCase()+'    ').slice(0,4);
+            return e.time+' '+label+' '+e.msg;
+        });
+        var body=lines.join('\n');
+        fetch('/api/log',{method:'POST',headers:{'Content-Type':'text/plain'},body:body})
+            .then(function(r){if(r.ok)showOk('\u2713 Log saved to ui_log.txt in mod folder');else showErr('Save failed: HTTP '+r.status);})
+            .catch(function(e){showErr('Save failed: '+(e.message||e));});
+    }
+};
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+// ── Takeover ──────────────────────────────────────────────────────────────────
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',takeover);
+else takeover();
+
+})();
+</script>

@@ -1,0 +1,28 @@
+# Build intermediates
+build/obj/
+
+# Runtime-generated files (not useful to track)
+debug.log
+services.log
+ui_log.txt
+automation_saves/
+
+# Saved log snapshots (optional, uncomment to track)
+# logs/
+
+# Internal planning docs (uncomment to exclude from public repo)
+# docs/bot_chat.md
+# docs/plans_*.md
+# docs/what_ive_learned.md
+# docs/investigation_*.md
+# docs/frontend_needs.md
+# docs/State.md
+
+# Claude Code internal files (memory, session state, local settings)
+.claude/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.user
+.vs/

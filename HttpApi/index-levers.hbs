@@ -1,0 +1,5 @@
+<script>
+window.TB=window.TB||{};
+window.TB.leversUrl="{{leversUrl}}";
+window.TB.levers=[{{#each levers}}{"name":"{{{name}}}","state":{{#if state}}true{{else}}false{{/if}},"isSpringReturn":{{#if isSpringReturn}}true{{else}}false{{/if}},"switchOnUrl":"{{{switchOnUrl}}}","switchOffUrl":"{{{switchOffUrl}}}","redUrl":"{{{redUrl}}}","greenUrl":"{{{greenUrl}}}","url":"{{{url}}}"}{{#unless @last}},{{/unless}}{{/each}}];
+</script>
